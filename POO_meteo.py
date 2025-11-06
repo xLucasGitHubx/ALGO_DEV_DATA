@@ -1,178 +1,217 @@
 # POO_meteo.py
-# ---------------------------------------
-# Petit framework "météo" + client Opendatasoft (ODS)
-# Domaine: https://data.toulouse-metropole.fr (modifiable via ENV/const)
+# ------------------------------------------------------------
+# Mini appli console pour découvrir l'API Opendatasoft (Explore v2.1)
+# de Toulouse Métropole et ingérer des mesures météo.
 #
-# Fonctionnement principal du "catalogue":
-# - On ne fait PLUS de where=search() sur /catalog/datasets (ça 400 parfois)
-# - On pagine le catalogue (limit=100) puis on filtre en Python (sans accents)
+# Points clés :
+# - Client HTTP ODS propre avec pagination.
+# - Recherche côté client (on évite where=search(...) source de 400).
+# - Filtre strict "météo" par analyse des CHAMPS (temp, vent, pluie, etc.).
+# - Ingestion triée par un vrai champ date/datetime, détecté automatiquement.
+# - Possibilité de forcer un dataset via ODS_DATASET_ID.
+# - Rendu console des datasets retenus + dernières observations.
 #
-# Exécution:
-#   python POO_meteo.py
-#
-# ---------------------------------------
+# Python 3.12+
+# ------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
-import json
-import math
+import sys
 import time
+import math
+import json
 import unicodedata
-import dataclasses
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 import requests
 
-
-# ==========================
-# Config
-# ==========================
+# ==============================
+# Constantes
+# ==============================
 
 DEFAULT_BASE_URL = os.environ.get(
     "ODS_BASE_URL",
-    "https://data.toulouse-metropole.fr",
+    "https://data.toulouse-metropole.fr/api/explore/v2.1"
 )
 
-HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))  # seconds
-CATALOG_PAGE_LIMIT = 100          # pagination size for catalog
-CATALOG_HARD_LIMIT = 2000         # safety bound when fetching all datasets
-RECORDS_PAGE_LIMIT = 100          # pagination size for dataset records
+HTTP_TIMEOUT = 20  # secondes
+CATALOG_PAGE_SIZE = 100  # max autorisé sans group_by
+CATALOG_HARD_LIMIT = 10_000  # sécurité
+RECORDS_PAGE_SIZE = 100  # max autorisé pour records
+PRINT_WIDTH = 110
 
 
-# ==========================
-# Helpers
-# ==========================
+# ==============================
+# Helpers simples
+# ==============================
 
 def _norm(s: str) -> str:
-    """
-    Normalise une chaîne pour recherche tolérante:
-    - str() + lower()
-    - NFKD + suppression des accents
-    - retourne "" si None
-    """
-    if s is None:
-        return ""
-    s = str(s).lower()
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in s if not unicodedata.combining(ch))
+    """Normalise texte : minuscule + suppression accents + trim."""
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    s = s.strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
 
 
-def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+def _parse_datetime_any(x: Any) -> Optional[datetime]:
+    """Tente de parser divers formats date/datetime retournés par ODS."""
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        return x
+    s = str(x).strip()
     if not s:
         return None
-    try:
-        # gère "2025-01-02T03:04:05+00:00" ou "2025-01-02"
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
+    # Formats fréquents
+    candidates = [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ]
+    for fmt in candidates:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    # Dernière chance : enlever le fuseau si présent
+    if s.endswith("Z"):
+        try:
+            return datetime.strptime(s[:-1], "%Y-%m-%dT%H:%M:%S.%f")
+        except ValueError:
+            try:
+                return datetime.strptime(s[:-1], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                pass
+    return None
 
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+# ==============================
+# Domain models
+# ==============================
+
+@dataclass
+class Station:
+    id: str
+    name: str
+    dataset_id: str
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
-# ==========================
-# ODS Client
-# ==========================
+@dataclass
+class WeatherRecord:
+    station_id: str
+    timestamp: Optional[datetime] = None
+    temperature_c: Optional[float] = None
+    humidity_pct: Optional[float] = None
+    pressure_hpa: Optional[float] = None
+    wind_speed_ms: Optional[float] = None
+    wind_dir_deg: Optional[float] = None
+    rain_mm: Optional[float] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+# ==============================
+# Repositories en mémoire
+# ==============================
+
+class WeatherRepositoryMemory:
+    def __init__(self) -> None:
+        self._stations: Dict[str, Station] = {}
+        self._records: Dict[str, List[WeatherRecord]] = {}
+
+    def upsert_station(self, st: Station) -> None:
+        self._stations[st.id] = st
+        self._records.setdefault(st.id, [])
+
+    def get_station(self, station_id: str) -> Optional[Station]:
+        return self._stations.get(station_id)
+
+    def list_stations(self) -> List[Station]:
+        return list(self._stations.values())
+
+    def add_record(self, station_id: str, rec: WeatherRecord) -> None:
+        self._records.setdefault(station_id, []).append(rec)
+
+    def latest_records(self, station_id: str, n: int = 5) -> List[WeatherRecord]:
+        arr = self._records.get(station_id, [])
+        arr = sorted(arr, key=lambda r: r.timestamp or datetime.min, reverse=True)
+        return arr[:n]
+
+
+# ==============================
+# Client ODS Explore v2.1
+# ==============================
 
 class ODSClient:
-    """
-    Client minimal Opendatasoft Explore v2.1
-    Docs interactives: {base}/api/explore/v2.1
-    """
-
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, session: Optional[requests.Session] = None):
+    def __init__(self, base_url: str = DEFAULT_BASE_URL) -> None:
         self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
-        # Petite UA propre pour le domaine
+        self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "POO-Meteo/1.0 (+LucasM; script demo)",
             "Accept": "application/json; charset=utf-8",
+            "User-Agent": "POO-Meteo/1.0 (+python requests)"
         })
 
-    # -------- Catalogue (datasets) --------
+    # --- HTTP core ---
 
-    def _catalog_search(self, query: Optional[str], hard_limit: int = CATALOG_HARD_LIMIT) -> List[Dict[str, Any]]:
-        """
-        ⚠️ Ne PAS utiliser where=search() côté catalog → certains domaines renvoient 400.
-        On récupère tout le catalogue par pages (limit<=100) puis on filtre en Python.
-        """
-        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets"
+    def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        resp = self.session.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+        # Lève si 4xx/5xx pour permettre un try/except côté appelant
+        resp.raise_for_status()
+        if resp.headers.get("Content-Type", "").startswith("application/json"):
+            return resp.json()
+        # Pour endpoints exports renvoyant des fichiers, on pourrait gérer bytes ici
+        return {"_raw": resp.content}
 
+    # --- Catalog ---
+
+    def catalog_datasets_page(
+        self,
+        limit: int = CATALOG_PAGE_SIZE,
+        offset: int = 0,
+        include_links: bool = False,
+        include_app_metas: bool = False,
+    ) -> Dict[str, Any]:
+        params = {
+            "limit": max(1, min(limit, CATALOG_PAGE_SIZE)),
+            "offset": max(0, offset),
+            "include_links": str(include_links).lower(),
+            "include_app_metas": str(include_app_metas).lower(),
+        }
+        return self._request("GET", "/catalog/datasets", params=params)
+
+    def catalog_datasets_iter(self, hard_limit: int = CATALOG_HARD_LIMIT) -> Generator[Dict[str, Any], None, None]:
+        """Page sur l'ensemble du catalogue, sans 'where' côté serveur pour éviter les 400."""
+        total_yielded = 0
         offset = 0
-        out: List[Dict[str, Any]] = []
-
         while True:
-            params = {
-                "limit": CATALOG_PAGE_LIMIT,
-                "offset": offset,
-                "include_links": "false",
-                "include_app_metas": "false",
-            }
-            r = self.session.get(url, params=params, timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            js = r.json()
-            results = js.get("results", [])
-            out.extend(results)
-
-            total = int(js.get("total_count", 0))
-            offset += CATALOG_PAGE_LIMIT
-            if offset >= total or len(out) >= hard_limit:
+            page = self.catalog_datasets_page(limit=CATALOG_PAGE_SIZE, offset=offset)
+            results = page.get("results", []) or []
+            if not results:
+                break
+            for ds in results:
+                yield ds
+                total_yielded += 1
+                if total_yielded >= hard_limit:
+                    return
+            offset += len(results)
+            # Sécurité anti-boucle
+            if offset >= (page.get("total_count") or 0):
                 break
 
-        # Filtrage local si query fournie
-        if query:
-            qn = _norm(query)
-            filtered: List[Dict[str, Any]] = []
-            for ds in out:
-                blob = _norm(json.dumps(ds, ensure_ascii=False))
-                if qn in blob:
-                    filtered.append(ds)
-            return filtered[:hard_limit]
-
-        return out[:hard_limit]
-
-    def find_weather_datasets(self) -> List[Dict[str, Any]]:
-        """
-        Cherche des datasets "météo" en récupérant d'abord le catalogue complet,
-        puis en filtrant localement sur des mots-clés (sans accents).
-        """
-        terms = [
-            "meteo", "météo", "temperature", "température",
-            "pluie", "precip", "précip", "vent", "rafale",
-            "station meteo", "capteur", "humid", "pression",
-            "uv", "ensoleil", "neige"
-        ]
-        all_ds = self._catalog_search(query=None, hard_limit=CATALOG_HARD_LIMIT)
-
-        seen: Dict[str, Dict[str, Any]] = {}
-        for ds in all_ds:
-            did = ds.get("dataset_id")
-            if not did or did in seen:
-                continue
-
-            blob = _norm(json.dumps(ds, ensure_ascii=False))
-            if any(_norm(t) in blob for t in terms):
-                # On garde si présence de champs météo potentiels
-                fields = [f.get("name", "").lower() for f in ds.get("fields", [])]
-                if any(k in blob for k in (
-                    "meteo", "temperature", "temp", "pluie", "precip", "vent",
-                    "humidity", "humidit", "pression", "pressure", "rafale", "gust"
-                )):
-                    seen[did] = ds
-
-        return list(seen.values())
-
-    # -------- Dataset info & records --------
+    # --- Dataset info & records ---
 
     def dataset_info(self, dataset_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/{dataset_id}"
-        r = self.session.get(url, timeout=HTTP_TIMEOUT, params={"include_links": "false", "include_app_metas": "false"})
-        r.raise_for_status()
-        return r.json()
+        path = f"/catalog/datasets/{dataset_id}"
+        return self._request("GET", path)
 
     def iter_records(
         self,
@@ -180,353 +219,327 @@ class ODSClient:
         select: Optional[str] = None,
         where: Optional[str] = None,
         order_by: Optional[str] = None,
-        limit: int = RECORDS_PAGE_LIMIT,
+        limit: int = RECORDS_PAGE_SIZE,
         max_rows: Optional[int] = None,
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Generator[Dict[str, Any], None, None]:
         """
-        Itère sur les enregistrements du dataset (pagination côté API).
-        - Contrairement au CATALOG, on peut utiliser where/order_by ici sans souci.
+        Itère sur les records du dataset.
+        NB: /records a un maximum de 100 par page. On page manuellement si max_rows > 100.
         """
-        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/{dataset_id}/records"
-        offset = 0
+        params_base = {}
+        if select:
+            params_base["select"] = select
+        if where:
+            params_base["where"] = where
+        if order_by:
+            params_base["order_by"] = order_by
+
         yielded = 0
-
+        offset = 0
         while True:
-            params: Dict[str, Any] = {
-                "limit": limit,
-                "offset": offset,
-            }
-            if select:
-                params["select"] = select
-            if where:
-                params["where"] = where
-            if order_by:
-                params["order_by"] = order_by
-
-            r = self.session.get(url, timeout=HTTP_TIMEOUT, params=params)
-            r.raise_for_status()
-            js = r.json()
-            results = js.get("results", [])
+            params = dict(params_base)
+            params["limit"] = min(RECORDS_PAGE_SIZE, (max_rows - yielded) if max_rows else RECORDS_PAGE_SIZE)
+            params["offset"] = offset
+            res = self._request("GET", f"/catalog/datasets/{dataset_id}/records", params=params)
+            results = res.get("results", []) or []
             if not results:
                 break
-
             for row in results:
                 yield row
                 yielded += 1
-                if max_rows is not None and yielded >= max_rows:
+                if max_rows and yielded >= max_rows:
                     return
-
-            total = int(js.get("total_count", 0))
-            offset += limit
-            if offset >= total:
+            offset += len(results)
+            # Stop si on a moins que la page -> plus rien à lire
+            if len(results) < params["limit"]:
                 break
 
 
-# ==========================
-# Domain model
-# ==========================
-
-@dataclass
-class Station:
-    id: str
-    name: str
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-    dataset_id: Optional[str] = None
-    raw: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class WeatherRecord:
-    ts: Optional[datetime]
-    temperature_c: Optional[float] = None
-    humidity_pct: Optional[float] = None
-    pressure_hpa: Optional[float] = None
-    wind_ms: Optional[float] = None
-    rainfall_mm: Optional[float] = None
-    station_id: Optional[str] = None
-    raw: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class WeatherSeries:
-    station: Station
-    records: List[WeatherRecord] = field(default_factory=list)
-
-    def latest(self) -> Optional[WeatherRecord]:
-        if not self.records:
-            return None
-        # Suppose ts peut être None -> trie en plaçant None en bas
-        return sorted(self.records, key=lambda r: (r.ts is None, r.ts))[-1]
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-
-# ==========================
-# Cleaner / Mapper
-# ==========================
+# ==============================
+# Nettoyage / mapping champs
+# ==============================
 
 class BasicCleaner:
     """
-    Convertit un enregistrement brut (dict ODS) en WeatherRecord
-    en essayant plusieurs alias de champs.
+    Transforme une ligne brute ODS en WeatherRecord.
+    Détecte au mieux les synonymes de champs (température, humidité, etc.)
     """
-    TEMP_KEYS = ["temperature", "temp_c", "temp", "tair", "temperature_c", "temperatures", "t"]
-    HUM_KEYS = ["humidity", "humidite", "humidite_%", "humidite_relative", "rh", "humi", "humidity_pct"]
-    PRES_KEYS = ["pression", "pression_hpa", "pressure", "p", "press"]
-    WIND_KEYS = ["wind", "wind_speed", "vitesse_vent", "vent_ms", "vent", "ffraf", "ff"]
-    RAIN_KEYS = ["rain", "pluie", "precip", "precip_mm", "rr", "pluie_mm"]
 
-    TS_KEYS = ["timestamp", "date_heure", "datetime", "time", "date", "obs_time", "measurement_time"]
+    TEMP_KEYS = ["temperature", "temp", "temp_c", "tair", "temperature_c", "t", "tc"]
+    HUM_KEYS = ["humidity", "humidite", "hum", "rh", "hr", "humidite_rel", "hum_rel"]
+    P_KEYS = ["pressure", "pression", "press_hpa", "pression_hpa", "p", "pa", "p_hpa"]
+    WIND_S_KEYS = ["wind_speed", "wind", "vitesse_vent", "ff", "ff10", "vent_ms", "vent_vitesse"]
+    WIND_D_KEYS = ["wind_dir", "wind_direction", "dd", "dir_vent", "direction_vent"]
+    RAIN_KEYS = ["rain", "pluie", "precipitation", "precipitations", "rr", "rr1", "rr24"]
 
-    def get_first(self, d: Dict[str, Any], keys: List[str]) -> Optional[Any]:
-        for k in keys:
-            if k in d:
-                return d.get(k)
-        # tente sans accents et minuscules
-        nd = { _norm(k): v for k, v in d.items() }
-        for k in keys:
-            if _norm(k) in nd:
-                return nd.get(_norm(k))
+    TS_PREF = ["date_observation", "date_mesure", "date_heure", "date", "datetime", "timestamp", "heure", "time"]
+
+    def _get_first(self, data: Dict[str, Any], keys: List[str]) -> Optional[Any]:
+        keys_norm = [_norm(k) for k in data.keys()]
+        mapping = {kn: k for k, kn in zip(data.keys(), keys_norm)}
+        for kk in keys:
+            kkn = _norm(kk)
+            if kkn in mapping:
+                return data[mapping[kkn]]
+        # fallback: recherche partielle
+        for kk in keys:
+            kkn = _norm(kk)
+            for kn, orig in mapping.items():
+                if kkn in kn:
+                    return data[orig]
         return None
 
-    def to_float(self, v: Any) -> Optional[float]:
-        if v is None or v == "":
+    def _to_float(self, x: Any) -> Optional[float]:
+        if x is None or x == "":
             return None
         try:
-            return float(v)
-        except Exception:
-            # parfois "12,3"
-            try:
-                return float(str(v).replace(",", "."))
-            except Exception:
-                return None
-
-    def to_dt(self, v: Any) -> Optional[datetime]:
-        if isinstance(v, datetime):
-            return v
-        if v is None:
+            return float(str(x).replace(",", "."))
+        except ValueError:
             return None
-        if isinstance(v, (int, float)) and v > 1e11:  # ms epoch?
-            try:
-                return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
-            except Exception:
-                pass
-        return _parse_dt(str(v))
 
-    def clean(self, raw: Dict[str, Any], station_id: Optional[str] = None) -> WeatherRecord:
-        # Les lignes ODS ont souvent ce format:
-        # {"field1": "...", ..., "geo_point_2d": {"lat": ..., "lon": ...}, "recordid": "..."}
-        # On travaille sur une "couche" qui peut être incluse (parfois, enregistrements imbriqués)
-        flat = dict(raw)
-        # certains datasets mettent la _source ou "fields" -> harmonisation légère
-        src = flat.get("fields") if isinstance(flat.get("fields"), dict) else None
-        if src:
-            for k, v in src.items():
-                flat.setdefault(k, v)
+    def clean(self, raw: Dict[str, Any], station_id: str) -> WeatherRecord:
+        # Timestamp
+        ts_raw = self._get_first(raw, self.TS_PREF)
+        ts = _parse_datetime_any(ts_raw)
 
-        ts = self.to_dt(self.get_first(flat, self.TS_KEYS))
-        temp = self.to_float(self.get_first(flat, self.TEMP_KEYS))
-        hum = self.to_float(self.get_first(flat, self.HUM_KEYS))
-        pres = self.to_float(self.get_first(flat, self.PRES_KEYS))
-        wind = self.to_float(self.get_first(flat, self.WIND_KEYS))
-        rain = self.to_float(self.get_first(flat, self.RAIN_KEYS))
+        # Mesures
+        t = self._to_float(self._get_first(raw, self.TEMP_KEYS))
+        hum = self._to_float(self._get_first(raw, self.HUM_KEYS))
+        p = self._to_float(self._get_first(raw, self.P_KEYS))
+        ws = self._to_float(self._get_first(raw, self.WIND_S_KEYS))
+        wd = self._to_float(self._get_first(raw, self.WIND_D_KEYS))
+        rr = self._to_float(self._get_first(raw, self.RAIN_KEYS))
 
         return WeatherRecord(
-            ts=ts,
-            temperature_c=temp,
-            humidity_pct=hum,
-            pressure_hpa=pres,
-            wind_ms=wind,
-            rainfall_mm=rain,
             station_id=station_id,
-            raw=raw,
+            timestamp=ts,
+            temperature_c=t,
+            humidity_pct=hum,
+            pressure_hpa=p,
+            wind_speed_ms=ws,
+            wind_dir_deg=wd,
+            rain_mm=rr,
+            raw=raw
         )
 
 
-# ==========================
-# Repository (mémoire)
-# ==========================
-
-class WeatherRepositoryMemory:
-    def __init__(self):
-        self.stations: Dict[str, Station] = {}
-        self.series_by_station: Dict[str, WeatherSeries] = {}
-
-    def upsert_station(self, st: Station) -> None:
-        self.stations[st.id] = st
-        self.series_by_station.setdefault(st.id, WeatherSeries(station=st))
-
-    def add_record(self, station_id: str, rec: WeatherRecord) -> None:
-        if station_id not in self.series_by_station:
-            raise KeyError(f"Station inconnue: {station_id}")
-        self.series_by_station[station_id].records.append(rec)
-
-    def get_series(self, station_id: str) -> Optional[WeatherSeries]:
-        return self.series_by_station.get(station_id)
-
-    def list_stations(self) -> List[Station]:
-        return list(self.stations.values())
-
-
-# ==========================
-# Catalogue Stations (démo)
-# ==========================
+# ==============================
+# Catalogue de stations (détection datasets météo)
+# ==============================
 
 class StationCatalogSimple:
     """
-    Pour la démo: on ne "résout" pas de vraies stations physiques.
-    On détecte des datasets météo candidats et on crée une pseudo-ligne par dataset.
+    Explore le catalogue et identifie des datasets 'météo' plausibles
+    en analysant les CHAMPS (noms + labels) — pas les métadonnées globales.
     """
 
-    def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory):
+    FIELD_KEYWORDS = [
+        # Température
+        "temperature", "température", "tair", "temp_c", "tc",
+        # Humidité
+        "humidity", "humidité", "rh", "hr",
+        # Pression
+        "pression", "pressure", "hpa",
+        # Vent
+        "vent", "wind", "rafale", "gust", "ff", "dd",
+        # Pluie
+        "pluie", "rain", "precipitation", "précipitation", "rr",
+        # Rayonnement / UV / soleil (bonus)
+        "uv", "ensoleil", "rayonnement", "solar"
+    ]
+    EXCLUDE_THEMES = {"finance", "citoyennete", "culture", "education", "mobilite", "transport"}
+
+    def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory) -> None:
         self.ods = ods
         self.repo = repo
-        self._datasets: List[Dict[str, Any]] = []
+        self._weather: List[Dict[str, Any]] = []
+
+    def _is_weather_like(self, ds: Dict[str, Any]) -> bool:
+        fields = ds.get("fields", []) or []
+        fields_text = " ".join(
+            f"{_norm(f.get('name') or '')} {_norm(f.get('label') or '')}"
+            for f in fields
+        )
+        has_measure = any(k in fields_text for k in self.FIELD_KEYWORDS)
+        if not has_measure:
+            return False
+
+        metas = (ds.get("metas", {}) or {}).get("default", {}) or {}
+        themes = [_norm(t) for t in (metas.get("theme") or [])]
+        if any(t in self.EXCLUDE_THEMES for t in themes):
+            # Certains datasets météo peuvent être rangés ailleurs : on est souple.
+            pass
+
+        # Bonus : présence d'un champ géo (fréquent pour capteurs)
+        has_geo = any((f.get("type") == "geo_point_2d") for f in fields)
+        return has_measure or has_geo
 
     def load(self) -> None:
         print("Chargement du catalogue (détection datasets météo)…")
-        self._datasets = self.ods.find_weather_datasets()
-        # On matérialise une "Station" par dataset pour l’exemple
-        for ds in self._datasets:
-            did = ds.get("dataset_id", "unknown-id")
-            title = (ds.get("metas", {}) or {}).get("default", {}).get("title") or did
-            # lat/lon non garanties au niveau dataset → None
-            st = Station(id=did, name=title, lat=None, lon=None, dataset_id=did, raw=ds)
+        # Pas de 'where' côté serveur -> pagination full + filtre local
+        items: List[Dict[str, Any]] = []
+        for ds in self.ods.catalog_datasets_iter(hard_limit=CATALOG_HARD_LIMIT):
+            if self._is_weather_like(ds):
+                items.append(ds)
+        self._weather = items
+
+        # Création de "stations" à partir des datasets retenus
+        for ds in self._weather:
+            metas = (ds.get("metas", {}) or {}).get("default", {}) or {}
+            title = metas.get("title") or ds.get("dataset_id")
+            dsid = ds.get("dataset_id")
+            if not dsid:
+                continue
+            st = Station(id=dsid, name=title, dataset_id=dsid, meta=metas)
             self.repo.upsert_station(st)
 
     def datasets(self) -> List[Dict[str, Any]]:
-        return self._datasets
+        return list(self._weather)
 
 
-# ==========================
-# Renderer (console)
-# ==========================
-
-class SimpleRenderer:
-    @staticmethod
-    def print_datasets(ds_list: List[Dict[str, Any]], max_rows: int = 20) -> None:
-        print("")
-        print("=== Candidats 'météo' détectés dans le catalogue ===")
-        if not ds_list:
-            print("(aucun)")
-            return
-        print(f"(affichage des {min(max_rows, len(ds_list))} premiers sur {len(ds_list)})")
-        print("")
-        print(f"{'dataset_id':<60}  {'records':>8}  title")
-        print("-" * 110)
-        for i, ds in enumerate(ds_list[:max_rows]):
-            did = ds.get("dataset_id", "-")
-            metas = (ds.get("metas", {}) or {}).get("default", {}) or {}
-            title = metas.get("title") or "-"
-            records = metas.get("records_count")
-            if records is None:
-                # parfois "has_records": bool
-                records = "?"
-            print(f"{did:<60}  {str(records):>8}  {title}")
-        print("-" * 110)
-
-    @staticmethod
-    def print_latest(repo: WeatherRepositoryMemory, max_rows: int = 10) -> None:
-        print("")
-        print("=== Observations récentes par 'station' (demo) ===")
-        stations = repo.list_stations()[:max_rows]
-        for st in stations:
-            series = repo.get_series(st.id)
-            last = series.latest() if series else None
-            if last and last.ts:
-                ts = last.ts.isoformat()
-            else:
-                ts = "-"
-            print(f"[{st.id}] {st.name}  •  dernière obs: {ts}")
-
-
-# ==========================
-# Services (ingestion, requêtes, forecast)
-# ==========================
+# ==============================
+# Services
+# ==============================
 
 class WeatherIngestionService:
-    """
-    Démo ingestion: pour chaque "station" (ici = dataset),
-    on tente de lire des enregistrements triés récents.
-    """
-    def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory, cleaner: BasicCleaner):
+    def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory, cleaner: BasicCleaner) -> None:
         self.ods = ods
         self.repo = repo
         self.cleaner = cleaner
 
+    def _find_first_date_field(self, dataset_id: str) -> Optional[str]:
+        info = self.ods.dataset_info(dataset_id)
+        fields = (info.get("fields") or [])
+        # priorité aux champs nommés logiquement
+        preferred = ["date_observation", "date_mesure", "date", "datetime", "timestamp", "time", "heure"]
+        by_type = [f.get("name") for f in fields if f.get("type") in ("date", "datetime")]
+        # D'abord "preferred" si présent, sinon premier champ date
+        for p in preferred:
+            if any(_norm(f.get("name") or "") == _norm(p) for f in fields):
+                return p
+        return by_type[0] if by_type else None
+
     def ingest_latest(self, station: Station, max_rows: int = 5) -> int:
+        """Ingestion des N dernières lignes d'un dataset trié par date décroissante si possible."""
         dataset_id = station.dataset_id
         if not dataset_id:
             return 0
 
+        order_field = None
+        try:
+            order_field = self._find_first_date_field(dataset_id)
+        except requests.HTTPError:
+            # On tentera sans tri explicite
+            order_field = None
+
+        order_by = f"{order_field} desc" if order_field else None
         count = 0
         try:
-            for row in self.ods.iter_records(
-                dataset_id=dataset_id,
-                order_by="date desc"  # si le champ existe; sinon l'API ignore
-            ):
+            for row in self.ods.iter_records(dataset_id=dataset_id, order_by=order_by, max_rows=max_rows):
                 rec = self.cleaner.clean(row, station_id=station.id)
                 self.repo.add_record(station.id, rec)
                 count += 1
-                if count >= max_rows:
-                    break
         except requests.HTTPError as e:
-            # datasets hétérogènes → certains n'ont pas de /records exploitable
-            # on ignore silencieusement pour la démo
-            pass
+            print(f"Échec lecture records ({dataset_id}) : {e}")
         return count
 
-    def ingest_all_latest(self, max_rows_per_station: int = 5, max_stations: int = 10) -> None:
-        stations = self.repo.list_stations()[:max_stations]
-        for st in stations:
-            _ = self.ingest_latest(st, max_rows=max_rows_per_station)
+    def ingest_all_latest(self, max_rows_per_station: int = 3, max_stations: int = 5) -> int:
+        total = 0
+        for st in self.repo.list_stations()[:max_stations]:
+            n = self.ingest_latest(st, max_rows=max_rows_per_station)
+            total += n
+        return total
 
 
 class WeatherQueryService:
-    def __init__(self, repo: WeatherRepositoryMemory):
+    def __init__(self, repo: WeatherRepositoryMemory) -> None:
         self.repo = repo
 
-    def latest_for_station(self, station_id: str) -> Optional[WeatherRecord]:
-        series = self.repo.get_series(station_id)
-        return series.latest() if series else None
-
-
-class SimpleForecaster:
-    """
-    Mini "prévision" jouet (moyenne glissante précédente).
-    """
-    def forecast_next_temp(self, series: WeatherSeries, window: int = 3) -> Optional[float]:
-        vals: List[float] = [r.temperature_c for r in series.records if r.temperature_c is not None]
-        if len(vals) == 0:
-            return None
-        if len(vals) <= window:
-            return sum(vals) / len(vals)
-        return sum(vals[-window:]) / window
+    def latest_for_station(self, station_id: str, n: int = 1) -> List[WeatherRecord]:
+        return self.repo.latest_records(station_id, n=n)
 
 
 class ForecastService:
-    def __init__(self, repo: WeatherRepositoryMemory):
+    """Prévision jouet = moyenne des 3 dernières températures observées."""
+    def __init__(self, repo: WeatherRepositoryMemory) -> None:
         self.repo = repo
-        self.model = SimpleForecaster()
 
-    def forecast_station_temp(self, station_id: str, window: int = 3) -> Optional[float]:
-        series = self.repo.get_series(station_id)
-        if not series:
+    def forecast_station_temp(self, station_id: str, last_n: int = 3) -> Optional[float]:
+        rows = self.repo.latest_records(station_id, n=last_n)
+        temps = [r.temperature_c for r in rows if r.temperature_c is not None]
+        if not temps:
             return None
-        return self.model.forecast_next_temp(series, window=window)
+        return sum(temps) / len(temps)
 
 
-# ==========================
-# CLI
-# ==========================
+# ==============================
+# Rendu console
+# ==============================
+
+class SimpleRenderer:
+    @staticmethod
+    def print_datasets(datasets: List[Dict[str, Any]], max_rows: int = 20) -> None:
+        print("\n=== Candidats 'météo' détectés dans le catalogue ===")
+        if not datasets:
+            print("(aucun dataset météo détecté via analyse des champs)")
+            return
+
+        print(f"(affichage des {min(max_rows, len(datasets))} premiers sur {len(datasets)})\n")
+        print(f"{'dataset_id':<60} {'records':>7}  title")
+        print("-" * PRINT_WIDTH)
+        for ds in datasets[:max_rows]:
+            dsid = ds.get("dataset_id", "") or ""
+            metas = (ds.get("metas", {}) or {}).get("default", {}) or {}
+            title = metas.get("title") or dsid
+            records = metas.get("records_count")
+            rec_s = f"{records}" if records is not None else "-"
+            print(f"{dsid:<60} {rec_s:>7}  {title[:PRINT_WIDTH-80]}")
+        print("-" * PRINT_WIDTH)
+
+    @staticmethod
+    def print_latest(repo: WeatherRepositoryMemory, max_rows: int = 5) -> None:
+        print("\n=== Observations récentes par 'station' ===")
+        for st in repo.list_stations():
+            latest = repo.latest_records(st.id, n=1)
+            if latest:
+                r = latest[0]
+                ts = r.timestamp.isoformat(sep=" ", timespec="seconds") if r.timestamp else "-"
+                t = f"{r.temperature_c:.1f}°C" if r.temperature_c is not None else "?"
+                hum = f"{r.humidity_pct:.0f}%" if r.humidity_pct is not None else "?"
+                ws = f"{r.wind_speed_ms:.1f} m/s" if r.wind_speed_ms is not None else "?"
+                rr = f"{r.rain_mm:.1f} mm" if r.rain_mm is not None else "0"
+                print(f"[{st.dataset_id}] {st.name}  •  dernière obs: {ts}  •  T={t}  H={hum}  Vent={ws}  Pluie={rr}")
+            else:
+                print(f"[{st.dataset_id}] {st.name}  •  dernière obs: -")
+
+
+# ==============================
+# Main
+# ==============================
 
 def main() -> None:
     ods = ODSClient(base_url=DEFAULT_BASE_URL)
     repo = WeatherRepositoryMemory()
     catalog = StationCatalogSimple(ods, repo)
 
+    # Option : forcer un dataset précis via variable d'environnement
+    force_id = os.environ.get("ODS_DATASET_ID")
+    if force_id:
+        print(f"Ingestion forcée du dataset: {force_id}")
+        st = Station(id=force_id, name=force_id, dataset_id=force_id)
+        repo.upsert_station(st)
+        ing = WeatherIngestionService(ods, repo, BasicCleaner())
+        ing.ingest_latest(st, max_rows=10)
+        SimpleRenderer.print_latest(repo, max_rows=1)
+
+        # Petite prévision jouet
+        fc = ForecastService(repo)
+        yhat = fc.forecast_station_temp(st.id)
+        if yhat is not None:
+            print(f"\nPrévision jouet pour {st.name} → temp ≈ {yhat:.2f} °C")
+        return
+
+    # Parcours du catalogue + détection datasets météo (filtre strict par champs)
     try:
         catalog.load()
     except requests.HTTPError as e:
@@ -536,15 +549,15 @@ def main() -> None:
     ds_candidates = catalog.datasets()
     SimpleRenderer.print_datasets(ds_candidates, max_rows=20)
 
-    # Ingestion démo sur quelques datasets → juste pour montrer que ça tourne
+    # Ingestion d'un petit échantillon pour quelques stations
     cleaner = BasicCleaner()
     ing = WeatherIngestionService(ods, repo, cleaner)
     ing.ingest_all_latest(max_rows_per_station=3, max_stations=5)
 
-    # Affichage dernières obs (si dispo)
+    # Rendu des dernières mesures
     SimpleRenderer.print_latest(repo, max_rows=5)
 
-    # Démo forecast "moyenne" si on a des valeurs
+    # Prévision jouet sur quelques stations
     fc = ForecastService(repo)
     for st in repo.list_stations()[:3]:
         yhat = fc.forecast_station_temp(st.id)
@@ -553,4 +566,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrompu par l'utilisateur.")
