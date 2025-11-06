@@ -1,639 +1,555 @@
-"""
-Toulouse Météo — OOP, SOLID, Clean Code (API only)
-=================================================
+# POO_meteo.py
+# ---------------------------------------
+# Petit framework "météo" + client Opendatasoft (ODS)
+# Domaine: https://data.toulouse-metropole.fr (modifiable via ENV/const)
+#
+# Fonctionnement principal du "catalogue":
+# - On ne fait PLUS de where=search() sur /catalog/datasets (ça 400 parfois)
+# - On pagine le catalogue (limit=100) puis on filtre en Python (sans accents)
+#
+# Exécution:
+#   python POO_meteo.py
+#
+# ---------------------------------------
 
-Run:
-  pip install -r requirements.txt
-  python app.py --metro "Capitole" --hours 24 --forecast 6 --profile
-
-requirements.txt (minimal)
-  requests
-  pandas
-  numpy
-  ydata-profiling    # optional
-  ydata-sdk          # optional
-
-Notes:
-- API only (no CSV) via Opendatasoft Explore v2.1.
-- Prefer Europe/Paris timezone.
-- If ydata-sdk is available, extended quality scoring/outliers/redundancy checks are attempted; else fallback.
-"""
 from __future__ import annotations
 
-import argparse
-import datetime as dt
-import math
 import os
-from abc import ABC, abstractmethod
+import json
+import math
+import time
+import unicodedata
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
 import requests
 
-try:
-    from ydata_profiling import ProfileReport  # type: ignore
-    _HAS_PROFILING = True
-except Exception:
-    _HAS_PROFILING = False
 
-try:
-    import ydata_sdk  # type: ignore
-    _HAS_YDATA_SDK = True
-except Exception:
-    _HAS_YDATA_SDK = False
+# ==========================
+# Config
+# ==========================
 
+DEFAULT_BASE_URL = os.environ.get(
+    "ODS_BASE_URL",
+    "https://data.toulouse-metropole.fr",
+)
 
-@dataclass(frozen=True)
-class StationId:
-    value: str
+HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))  # seconds
+CATALOG_PAGE_LIMIT = 100          # pagination size for catalog
+CATALOG_HARD_LIMIT = 2000         # safety bound when fetching all datasets
+RECORDS_PAGE_LIMIT = 100          # pagination size for dataset records
 
 
-@dataclass(frozen=True)
-class StationLigne:
-    code: Optional[str] = None
-    name: Optional[str] = None
+# ==========================
+# Helpers
+# ==========================
 
+def _norm(s: str) -> str:
+    """
+    Normalise une chaîne pour recherche tolérante:
+    - str() + lower()
+    - NFKD + suppression des accents
+    - retourne "" si None
+    """
+    if s is None:
+        return ""
+    s = str(s).lower()
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+
+def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # gère "2025-01-02T03:04:05+00:00" ou "2025-01-02"
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ==========================
+# ODS Client
+# ==========================
+
+class ODSClient:
+    """
+    Client minimal Opendatasoft Explore v2.1
+    Docs interactives: {base}/api/explore/v2.1
+    """
+
+    def __init__(self, base_url: str = DEFAULT_BASE_URL, session: Optional[requests.Session] = None):
+        self.base_url = base_url.rstrip("/")
+        self.session = session or requests.Session()
+        # Petite UA propre pour le domaine
+        self.session.headers.update({
+            "User-Agent": "POO-Meteo/1.0 (+LucasM; script demo)",
+            "Accept": "application/json; charset=utf-8",
+        })
+
+    # -------- Catalogue (datasets) --------
+
+    def _catalog_search(self, query: Optional[str], hard_limit: int = CATALOG_HARD_LIMIT) -> List[Dict[str, Any]]:
+        """
+        ⚠️ Ne PAS utiliser where=search() côté catalog → certains domaines renvoient 400.
+        On récupère tout le catalogue par pages (limit<=100) puis on filtre en Python.
+        """
+        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets"
+
+        offset = 0
+        out: List[Dict[str, Any]] = []
+
+        while True:
+            params = {
+                "limit": CATALOG_PAGE_LIMIT,
+                "offset": offset,
+                "include_links": "false",
+                "include_app_metas": "false",
+            }
+            r = self.session.get(url, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            js = r.json()
+            results = js.get("results", [])
+            out.extend(results)
+
+            total = int(js.get("total_count", 0))
+            offset += CATALOG_PAGE_LIMIT
+            if offset >= total or len(out) >= hard_limit:
+                break
+
+        # Filtrage local si query fournie
+        if query:
+            qn = _norm(query)
+            filtered: List[Dict[str, Any]] = []
+            for ds in out:
+                blob = _norm(json.dumps(ds, ensure_ascii=False))
+                if qn in blob:
+                    filtered.append(ds)
+            return filtered[:hard_limit]
+
+        return out[:hard_limit]
+
+    def find_weather_datasets(self) -> List[Dict[str, Any]]:
+        """
+        Cherche des datasets "météo" en récupérant d'abord le catalogue complet,
+        puis en filtrant localement sur des mots-clés (sans accents).
+        """
+        terms = [
+            "meteo", "météo", "temperature", "température",
+            "pluie", "precip", "précip", "vent", "rafale",
+            "station meteo", "capteur", "humid", "pression",
+            "uv", "ensoleil", "neige"
+        ]
+        all_ds = self._catalog_search(query=None, hard_limit=CATALOG_HARD_LIMIT)
+
+        seen: Dict[str, Dict[str, Any]] = {}
+        for ds in all_ds:
+            did = ds.get("dataset_id")
+            if not did or did in seen:
+                continue
+
+            blob = _norm(json.dumps(ds, ensure_ascii=False))
+            if any(_norm(t) in blob for t in terms):
+                # On garde si présence de champs météo potentiels
+                fields = [f.get("name", "").lower() for f in ds.get("fields", [])]
+                if any(k in blob for k in (
+                    "meteo", "temperature", "temp", "pluie", "precip", "vent",
+                    "humidity", "humidit", "pression", "pressure", "rafale", "gust"
+                )):
+                    seen[did] = ds
+
+        return list(seen.values())
+
+    # -------- Dataset info & records --------
+
+    def dataset_info(self, dataset_id: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/{dataset_id}"
+        r = self.session.get(url, timeout=HTTP_TIMEOUT, params={"include_links": "false", "include_app_metas": "false"})
+        r.raise_for_status()
+        return r.json()
+
+    def iter_records(
+        self,
+        dataset_id: str,
+        select: Optional[str] = None,
+        where: Optional[str] = None,
+        order_by: Optional[str] = None,
+        limit: int = RECORDS_PAGE_LIMIT,
+        max_rows: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Itère sur les enregistrements du dataset (pagination côté API).
+        - Contrairement au CATALOG, on peut utiliser where/order_by ici sans souci.
+        """
+        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/{dataset_id}/records"
+        offset = 0
+        yielded = 0
+
+        while True:
+            params: Dict[str, Any] = {
+                "limit": limit,
+                "offset": offset,
+            }
+            if select:
+                params["select"] = select
+            if where:
+                params["where"] = where
+            if order_by:
+                params["order_by"] = order_by
+
+            r = self.session.get(url, timeout=HTTP_TIMEOUT, params=params)
+            r.raise_for_status()
+            js = r.json()
+            results = js.get("results", [])
+            if not results:
+                break
+
+            for row in results:
+                yield row
+                yielded += 1
+                if max_rows is not None and yielded >= max_rows:
+                    return
+
+            total = int(js.get("total_count", 0))
+            offset += limit
+            if offset >= total:
+                break
+
+
+# ==========================
+# Domain model
+# ==========================
 
 @dataclass
 class Station:
-    id: StationId
+    id: str
     name: str
-    latitude: float
-    longitude: float
-    kind: str
-    ligne: Optional[StationLigne] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    dataset_id: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass
 class WeatherRecord:
-    station_id: StationId
-    timestamp: dt.datetime
-    temperature_c: Optional[float]
-    humidity_pct: Optional[float]
-    pressure_hpa: Optional[float]
+    ts: Optional[datetime]
+    temperature_c: Optional[float] = None
+    humidity_pct: Optional[float] = None
+    pressure_hpa: Optional[float] = None
+    wind_ms: Optional[float] = None
+    rainfall_mm: Optional[float] = None
+    station_id: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class WeatherSeries:
     station: Station
-    records: List[WeatherRecord]
+    records: List[WeatherRecord] = field(default_factory=list)
 
-
-class IDataSource(ABC):
-    @abstractmethod
-    def fetch_weather_station_catalog(self) -> List[Station]:
-        ...
-
-    @abstractmethod
-    def fetch_metro_station_catalog(self) -> List[Station]:
-        ...
-
-    @abstractmethod
-    def fetch_weather_records(
-        self,
-        dataset_id: str,
-        since: Optional[dt.datetime] = None,
-        until: Optional[dt.datetime] = None,
-        limit: int = 10_000,
-    ) -> pd.DataFrame:
-        ...
-
-
-class ICleaner(ABC):
-    @abstractmethod
-    def clean_weather_df(self, df: pd.DataFrame, station_id: StationId) -> pd.DataFrame:
-        ...
-
-
-class IForecaster(ABC):
-    @abstractmethod
-    def forecast(self, df: pd.DataFrame, horizon_hours: int, freq: str = "1H") -> pd.DataFrame:
-        ...
-
-
-class IRepository(ABC):
-    @abstractmethod
-    def save_series(self, series: WeatherSeries) -> None:
-        ...
-
-    @abstractmethod
-    def get_series(
-        self,
-        station_id: StationId,
-        since: Optional[dt.datetime] = None,
-        until: Optional[dt.datetime] = None,
-    ) -> pd.DataFrame:
-        ...
-
-
-class IRenderer(ABC):
-    @abstractmethod
-    def show_current(self, df: pd.DataFrame) -> None:
-        ...
-
-    @abstractmethod
-    def show_forecast(self, df_fc: pd.DataFrame) -> None:
-        ...
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
-
-
-class OpendatasoftAPIDataSource(IDataSource):
-    def __init__(self, base_url: str = "https://data.toulouse-metropole.fr") -> None:
-        self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "toulouse-meteo-app/1.1"})
-
-    def fetch_weather_station_catalog(self) -> List[Station]:
-        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/stations-meteo-en-place/records"
-        params = {"limit": 1000}
-        r = self.session.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        stations: List[Station] = []
-        for rec in data.get("results", []):
-            fields = rec.get("fields", {})
-            geom = rec.get("geometry", {}) or {}
-            name = fields.get("nom") or fields.get("name") or fields.get("station") or "Station météo"
-            id_num = fields.get("id_numero") or fields.get("numero") or fields.get("id") or ""
-            lat, lon = None, None
-            if "geo_point_2d" in fields and isinstance(fields["geo_point_2d"], dict):
-                lat = fields["geo_point_2d"].get("lat")
-                lon = fields["geo_point_2d"].get("lon")
-            elif geom and geom.get("type") == "Point":
-                coords = geom.get("coordinates") or [None, None]
-                lon, lat = coords[0], coords[1]
-            if lat is None or lon is None:
-                continue
-            stations.append(
-                Station(
-                    id=StationId(str(id_num)),
-                    name=str(name),
-                    latitude=float(lat),
-                    longitude=float(lon),
-                    kind="weather",
-                    extra={"raw_fields": fields},
-                )
-            )
-        return stations
-
-    def fetch_metro_station_catalog(self) -> List[Station]:
-        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/arret_physique/records"
-        params = {"limit": 5000}
-        r = self.session.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        stations: List[Station] = []
-        for rec in data.get("results", []):
-            fields = rec.get("fields", {})
-            geom = rec.get("geometry", {}) or {}
-            mode_val = str(fields.get("mode") or fields.get("modes") or fields.get("mode_texte") or "").upper()
-            if "METRO" not in mode_val:
-                continue
-            name = fields.get("nom") or fields.get("stop_name") or fields.get("nom_arret") or "Station"
-            code = fields.get("code") or fields.get("stop_code") or fields.get("id") or name
-            line = fields.get("ligne") or fields.get("line")
-            lat, lon = None, None
-            if "geo_point_2d" in fields and isinstance(fields["geo_point_2d"], dict):
-                lat = fields["geo_point_2d"].get("lat")
-                lon = fields["geo_point_2d"].get("lon")
-            elif geom and geom.get("type") == "Point":
-                coords = geom.get("coordinates") or [None, None]
-                lon, lat = coords[0], coords[1]
-            if lat is None or lon is None:
-                continue
-            stations.append(
-                Station(
-                    id=StationId(str(code)),
-                    name=str(name),
-                    latitude=float(lat),
-                    longitude=float(lon),
-                    kind="metro",
-                    ligne=StationLigne(code=str(line) if line else None),
-                    extra={"raw_fields": fields},
-                )
-            )
-        return stations
-
-    def _guess_station_dataset_id(self, weather_num: str) -> Optional[str]:
-        q = f"{self.base_url}/api/explore/v2.1/catalog/datasets"
-        params = {"search": f"{weather_num}-station meteo"}
-        try:
-            r = self.session.get(q, params=params, timeout=20)
-            r.raise_for_status()
-            items = r.json().get("datasets", [])
-            for item in items:
-                dsid = item.get("dataset_id") or item.get("datasetid") or item.get("dataset")
-                if not dsid:
-                    continue
-                if str(dsid).startswith(f"{weather_num}-station-meteo-"):
-                    return dsid
-        except Exception:
+    def latest(self) -> Optional[WeatherRecord]:
+        if not self.records:
             return None
+        # Suppose ts peut être None -> trie en plaçant None en bas
+        return sorted(self.records, key=lambda r: (r.ts is None, r.ts))[-1]
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+
+# ==========================
+# Cleaner / Mapper
+# ==========================
+
+class BasicCleaner:
+    """
+    Convertit un enregistrement brut (dict ODS) en WeatherRecord
+    en essayant plusieurs alias de champs.
+    """
+    TEMP_KEYS = ["temperature", "temp_c", "temp", "tair", "temperature_c", "temperatures", "t"]
+    HUM_KEYS = ["humidity", "humidite", "humidite_%", "humidite_relative", "rh", "humi", "humidity_pct"]
+    PRES_KEYS = ["pression", "pression_hpa", "pressure", "p", "press"]
+    WIND_KEYS = ["wind", "wind_speed", "vitesse_vent", "vent_ms", "vent", "ffraf", "ff"]
+    RAIN_KEYS = ["rain", "pluie", "precip", "precip_mm", "rr", "pluie_mm"]
+
+    TS_KEYS = ["timestamp", "date_heure", "datetime", "time", "date", "obs_time", "measurement_time"]
+
+    def get_first(self, d: Dict[str, Any], keys: List[str]) -> Optional[Any]:
+        for k in keys:
+            if k in d:
+                return d.get(k)
+        # tente sans accents et minuscules
+        nd = { _norm(k): v for k, v in d.items() }
+        for k in keys:
+            if _norm(k) in nd:
+                return nd.get(_norm(k))
         return None
 
-    def fetch_weather_records(
-        self,
-        dataset_id: str,
-        since: Optional[dt.datetime] = None,
-        until: Optional[dt.datetime] = None,
-        limit: int = 10_000,
-    ) -> pd.DataFrame:
-        url = f"{self.base_url}/api/explore/v2.1/catalog/datasets/{dataset_id}/records"
-        params: Dict[str, Any] = {
-            "limit": limit,
-            "order_by": "timestamp DESC,date DESC,datetime DESC,heure DESC",
-        }
-        r = self.session.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        js = r.json()
-        rows = js.get("results", [])
-        if not rows:
-            return pd.DataFrame()
-        df = pd.json_normalize(rows)
-        field_cols = [c for c in df.columns if c.startswith("fields.")]
-        if field_cols:
-            df = df[field_cols].rename(columns=lambda c: c.replace("fields.", ""))
-        return df
-
-
-class BasicCleaner(ICleaner):
-    TZ = "Europe/Paris"
-
-    def _parse_dt(self, s: Any) -> Optional[dt.datetime]:
-        if pd.isna(s):
+    def to_float(self, v: Any) -> Optional[float]:
+        if v is None or v == "":
             return None
         try:
-            t = pd.to_datetime(s, utc=False)
-            if t.tzinfo is None:
-                return t.tz_localize(self.TZ)  # type: ignore
-            else:
-                return t.tz_convert(self.TZ)  # type: ignore
+            return float(v)
         except Exception:
+            # parfois "12,3"
+            try:
+                return float(str(v).replace(",", "."))
+            except Exception:
+                return None
+
+    def to_dt(self, v: Any) -> Optional[datetime]:
+        if isinstance(v, datetime):
+            return v
+        if v is None:
             return None
+        if isinstance(v, (int, float)) and v > 1e11:  # ms epoch?
+            try:
+                return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
+            except Exception:
+                pass
+        return _parse_dt(str(v))
 
-    def _col(self, df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-        for c in candidates:
-            if c in df.columns:
-                return c
-        low = {c.lower(): c for c in df.columns}
-        for c in candidates:
-            if c.lower() in low:
-                return low[c.lower()]
-        return None
+    def clean(self, raw: Dict[str, Any], station_id: Optional[str] = None) -> WeatherRecord:
+        # Les lignes ODS ont souvent ce format:
+        # {"field1": "...", ..., "geo_point_2d": {"lat": ..., "lon": ...}, "recordid": "..."}
+        # On travaille sur une "couche" qui peut être incluse (parfois, enregistrements imbriqués)
+        flat = dict(raw)
+        # certains datasets mettent la _source ou "fields" -> harmonisation légère
+        src = flat.get("fields") if isinstance(flat.get("fields"), dict) else None
+        if src:
+            for k, v in src.items():
+                flat.setdefault(k, v)
 
-    def clean_weather_df(self, df: pd.DataFrame, station_id: StationId) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame(columns=["timestamp", "station_id", "temperature_c", "humidity_pct", "pressure_hpa"]).set_index("timestamp")
-        ts_col = self._col(df, ["timestamp", "date", "datetime", "heure", "date_heure"])
-        t_col = self._col(df, ["temperature_c", "temperature", "temp", "t", "tc", "temp_c"])
-        h_col = self._col(df, ["humidity_pct", "humidite", "humidity", "hum", "rh", "h"])  # relative humidity
-        p_col = self._col(df, ["pressure_hpa", "pression", "pression_hpa", "p", "pa", "press"])
-        out = pd.DataFrame()
-        out["timestamp"] = df[ts_col] if ts_col else pd.NaT
-        out["timestamp"] = out["timestamp"].map(self._parse_dt)
-        out["station_id"] = station_id.value
-        out["temperature_c"] = pd.to_numeric(df[t_col], errors="coerce") if t_col else np.nan
-        out["humidity_pct"] = pd.to_numeric(df[h_col], errors="coerce") if h_col else np.nan
-        out["pressure_hpa"] = pd.to_numeric(df[p_col], errors="coerce") if p_col else np.nan
-        out = out.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
-        if "humidity_pct" in out.columns:
-            out["humidity_pct"] = out["humidity_pct"].clip(lower=0, upper=100)
-        return out
+        ts = self.to_dt(self.get_first(flat, self.TS_KEYS))
+        temp = self.to_float(self.get_first(flat, self.TEMP_KEYS))
+        hum = self.to_float(self.get_first(flat, self.HUM_KEYS))
+        pres = self.to_float(self.get_first(flat, self.PRES_KEYS))
+        wind = self.to_float(self.get_first(flat, self.WIND_KEYS))
+        rain = self.to_float(self.get_first(flat, self.RAIN_KEYS))
 
-
-class SimpleForecaster(IForecaster):
-    def forecast(self, df: pd.DataFrame, horizon_hours: int, freq: str = "1H") -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame()
-        cols = [c for c in ["temperature_c", "humidity_pct", "pressure_hpa"] if c in df.columns]
-        base = df[cols].copy()
-        base = base.resample(freq).last().ffill(limit=3)
-        last_idx = base.index.max()
-        if pd.isna(last_idx):
-            return pd.DataFrame()
-        ma = base.rolling(window=3, min_periods=1).mean()
-        if "temperature_c" in base.columns and len(base) >= 3:
-            tail = base["temperature_c"].tail(6)
-            x = np.arange(len(tail))
-            if tail.notna().sum() >= 2:
-                coeffs = np.polyfit(x[tail.notna()], tail[tail.notna()], 1)
-                slope = coeffs[0]
-            else:
-                slope = 0.0
-        else:
-            slope = 0.0
-        future_idx = pd.date_range(start=last_idx + pd.tseries.frequencies.to_offset(freq), periods=horizon_hours, freq=freq)
-        fc = pd.DataFrame(index=future_idx, columns=cols, dtype=float)
-        last_ma = ma.iloc[-1]
-        for i, ts in enumerate(future_idx, start=1):
-            for c in cols:
-                val = float(last_ma.get(c)) if pd.notna(last_ma.get(c)) else np.nan
-                if c == "temperature_c":
-                    val = val + slope * i
-                fc.loc[ts, c] = val
-        return fc
-
-
-class WeatherRepositoryMemory(IRepository):
-    def __init__(self) -> None:
-        self._store: Dict[str, pd.DataFrame] = {}
-
-    def save_series(self, series: WeatherSeries) -> None:
-        df = pd.DataFrame(
-            [
-                {
-                    "timestamp": r.timestamp,
-                    "station_id": series.station.id.value,
-                    "temperature_c": r.temperature_c,
-                    "humidity_pct": r.humidity_pct,
-                    "pressure_hpa": r.pressure_hpa,
-                }
-                for r in series.records
-            ]
+        return WeatherRecord(
+            ts=ts,
+            temperature_c=temp,
+            humidity_pct=hum,
+            pressure_hpa=pres,
+            wind_ms=wind,
+            rainfall_mm=rain,
+            station_id=station_id,
+            raw=raw,
         )
-        if df.empty:
-            return
-        df = df.set_index("timestamp").sort_index()
-        sid = series.station.id.value
-        if sid in self._store and not self._store[sid].empty:
-            self._store[sid] = pd.concat([self._store[sid], df]).sort_index()
-        else:
-            self._store[sid] = df
-        self._store[sid] = self._store[sid][~self._store[sid].index.duplicated(keep="last")]
-
-    def get_series(
-        self,
-        station_id: StationId,
-        since: Optional[dt.datetime] = None,
-        until: Optional[dt.datetime] = None,
-    ) -> pd.DataFrame:
-        sid = station_id.value
-        df = self._store.get(sid, pd.DataFrame())
-        if df.empty:
-            return df
-        if since is not None:
-            df = df[df.index >= since]
-        if until is not None:
-            df = df[df.index <= until]
-        return df.sort_index()
 
 
-class SimpleRenderer(IRenderer):
-    def show_current(self, df: pd.DataFrame) -> None:
-        if df.empty:
-            print("Aucune donnée météo disponible.")
-            return
-        last = df.iloc[-1]
-        ts = df.index[-1]
-        t = last.get("temperature_c")
-        h = last.get("humidity_pct")
-        p = last.get("pressure_hpa")
-        print(f"\n— Observation la plus récente — {ts.tz_convert('Europe/Paris') if ts.tzinfo else ts}:")
-        print(f"  Température: {t:.1f} °C" if pd.notna(t) else "  Température: n/d")
-        print(f"  Humidité   : {h:.0f} %" if pd.notna(h) else "  Humidité   : n/d")
-        print(f"  Pression   : {p:.0f} hPa" if pd.notna(p) else "  Pression   : n/d")
+# ==========================
+# Repository (mémoire)
+# ==========================
 
-    def show_forecast(self, df_fc: pd.DataFrame) -> None:
-        if df_fc.empty:
-            print("\nPas de prévision disponible.")
-            return
-        print("\n— Prévision (heure par heure) —")
-        for ts, row in df_fc.iterrows():
-            t = row.get("temperature_c")
-            h = row.get("humidity_pct")
-            p = row.get("pressure_hpa")
-            ts_local = ts.tz_convert('Europe/Paris') if ts.tzinfo else ts
-            print(
-                f"  {ts_local:%Y-%m-%d %H:%M}  T={t:.1f}°C  H={h:.0f}%  P={p:.0f}hPa"
-                if all(pd.notna([t, h, p]))
-                else f"  {ts_local:%Y-%m-%d %H:%M}  (valeurs partielles)"
-            )
+class WeatherRepositoryMemory:
+    def __init__(self):
+        self.stations: Dict[str, Station] = {}
+        self.series_by_station: Dict[str, WeatherSeries] = {}
 
+    def upsert_station(self, st: Station) -> None:
+        self.stations[st.id] = st
+        self.series_by_station.setdefault(st.id, WeatherSeries(station=st))
+
+    def add_record(self, station_id: str, rec: WeatherRecord) -> None:
+        if station_id not in self.series_by_station:
+            raise KeyError(f"Station inconnue: {station_id}")
+        self.series_by_station[station_id].records.append(rec)
+
+    def get_series(self, station_id: str) -> Optional[WeatherSeries]:
+        return self.series_by_station.get(station_id)
+
+    def list_stations(self) -> List[Station]:
+        return list(self.stations.values())
+
+
+# ==========================
+# Catalogue Stations (démo)
+# ==========================
 
 class StationCatalogSimple:
-    def __init__(self, datasource: IDataSource) -> None:
-        self.ds = datasource
-        self._weather: List[Station] = []
-        self._metro: List[Station] = []
+    """
+    Pour la démo: on ne "résout" pas de vraies stations physiques.
+    On détecte des datasets météo candidats et on crée une pseudo-ligne par dataset.
+    """
+
+    def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory):
+        self.ods = ods
+        self.repo = repo
+        self._datasets: List[Dict[str, Any]] = []
 
     def load(self) -> None:
-        self._weather = self.ds.fetch_weather_station_catalog()
-        self._metro = self.ds.fetch_metro_station_catalog()
+        print("Chargement du catalogue (détection datasets météo)…")
+        self._datasets = self.ods.find_weather_datasets()
+        # On matérialise une "Station" par dataset pour l’exemple
+        for ds in self._datasets:
+            did = ds.get("dataset_id", "unknown-id")
+            title = (ds.get("metas", {}) or {}).get("default", {}).get("title") or did
+            # lat/lon non garanties au niveau dataset → None
+            st = Station(id=did, name=title, lat=None, lon=None, dataset_id=did, raw=ds)
+            self.repo.upsert_station(st)
 
-    def all_metro(self) -> List[Station]:
-        return list(self._metro)
+    def datasets(self) -> List[Dict[str, Any]]:
+        return self._datasets
 
-    def all_weather(self) -> List[Station]:
-        return list(self._weather)
 
-    def find_metro(self, name_query: str) -> Optional[Station]:
-        name_query_low = name_query.strip().lower()
-        if not name_query_low:
-            return None
-        best: Tuple[float, Optional[Station]] = (-1.0, None)
-        for st in self._metro:
-            n = st.name.lower()
-            if name_query_low in n or n.startswith(name_query_low):
-                return st
-            overlap = len(set(n.split()) & set(name_query_low.split())) / max(1, len(set(name_query_low.split())))
-            if overlap > best[0]:
-                best = (overlap, st)
-        return best[1]
+# ==========================
+# Renderer (console)
+# ==========================
 
-    def nearest_weather_for(self, metro_station: Station) -> Optional[Station]:
-        if not self._weather:
-            return None
-        best = None
-        best_d = 1e9
-        for w in self._weather:
-            d = haversine_km(metro_station.latitude, metro_station.longitude, w.latitude, w.longitude)
-            if d < best_d:
-                best_d = d
-                best = w
-        return best
+class SimpleRenderer:
+    @staticmethod
+    def print_datasets(ds_list: List[Dict[str, Any]], max_rows: int = 20) -> None:
+        print("")
+        print("=== Candidats 'météo' détectés dans le catalogue ===")
+        if not ds_list:
+            print("(aucun)")
+            return
+        print(f"(affichage des {min(max_rows, len(ds_list))} premiers sur {len(ds_list)})")
+        print("")
+        print(f"{'dataset_id':<60}  {'records':>8}  title")
+        print("-" * 110)
+        for i, ds in enumerate(ds_list[:max_rows]):
+            did = ds.get("dataset_id", "-")
+            metas = (ds.get("metas", {}) or {}).get("default", {}) or {}
+            title = metas.get("title") or "-"
+            records = metas.get("records_count")
+            if records is None:
+                # parfois "has_records": bool
+                records = "?"
+            print(f"{did:<60}  {str(records):>8}  {title}")
+        print("-" * 110)
 
+    @staticmethod
+    def print_latest(repo: WeatherRepositoryMemory, max_rows: int = 10) -> None:
+        print("")
+        print("=== Observations récentes par 'station' (demo) ===")
+        stations = repo.list_stations()[:max_rows]
+        for st in stations:
+            series = repo.get_series(st.id)
+            last = series.latest() if series else None
+            if last and last.ts:
+                ts = last.ts.isoformat()
+            else:
+                ts = "-"
+            print(f"[{st.id}] {st.name}  •  dernière obs: {ts}")
+
+
+# ==========================
+# Services (ingestion, requêtes, forecast)
+# ==========================
 
 class WeatherIngestionService:
-    def __init__(self, datasource: OpendatasoftAPIDataSource, cleaner: ICleaner, repo: IRepository, catalog: StationCatalogSimple) -> None:
-        self.ds = datasource
-        self.cleaner = cleaner
+    """
+    Démo ingestion: pour chaque "station" (ici = dataset),
+    on tente de lire des enregistrements triés récents.
+    """
+    def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory, cleaner: BasicCleaner):
+        self.ods = ods
         self.repo = repo
-        self.catalog = catalog
+        self.cleaner = cleaner
 
-    def ingest_station(self, weather_station: Station, hours: int = 24) -> pd.DataFrame:
-        num = "".join([c for c in weather_station.id.value if c.isdigit()])
-        dsid = self.ds._guess_station_dataset_id(num) if num else None
-        if not dsid:
-            raise RuntimeError(f"Impossible de déterminer le dataset pour la station météo {weather_station.name} (id={weather_station.id.value}).")
-        until = pd.Timestamp.now(tz="Europe/Paris")
-        since = until - pd.Timedelta(hours=hours)
-        raw = self.ds.fetch_weather_records(dataset_id=dsid, since=since.to_pydatetime(), until=until.to_pydatetime())
-        clean = self.cleaner.clean_weather_df(raw, weather_station.id)
-        clean = clean[(clean.index >= since) & (clean.index <= until)]
-        records = [
-            WeatherRecord(
-                station_id=weather_station.id,
-                timestamp=ts,
-                temperature_c=float(row["temperature_c"]) if pd.notna(row.get("temperature_c")) else None,
-                humidity_pct=float(row["humidity_pct"]) if pd.notna(row.get("humidity_pct")) else None,
-                pressure_hpa=float(row["pressure_hpa"]) if pd.notna(row.get("pressure_hpa")) else None,
-            )
-            for ts, row in clean.iterrows()
-        ]
-        series = WeatherSeries(station=weather_station, records=records)
-        self.repo.save_series(series)
-        return clean
+    def ingest_latest(self, station: Station, max_rows: int = 5) -> int:
+        dataset_id = station.dataset_id
+        if not dataset_id:
+            return 0
+
+        count = 0
+        try:
+            for row in self.ods.iter_records(
+                dataset_id=dataset_id,
+                order_by="date desc"  # si le champ existe; sinon l'API ignore
+            ):
+                rec = self.cleaner.clean(row, station_id=station.id)
+                self.repo.add_record(station.id, rec)
+                count += 1
+                if count >= max_rows:
+                    break
+        except requests.HTTPError as e:
+            # datasets hétérogènes → certains n'ont pas de /records exploitable
+            # on ignore silencieusement pour la démo
+            pass
+        return count
+
+    def ingest_all_latest(self, max_rows_per_station: int = 5, max_stations: int = 10) -> None:
+        stations = self.repo.list_stations()[:max_stations]
+        for st in stations:
+            _ = self.ingest_latest(st, max_rows=max_rows_per_station)
 
 
 class WeatherQueryService:
-    def __init__(self, repo: IRepository, renderer: IRenderer) -> None:
+    def __init__(self, repo: WeatherRepositoryMemory):
         self.repo = repo
-        self.renderer = renderer
 
-    def show_current_for(self, station: Station) -> pd.DataFrame:
-        df = self.repo.get_series(station.id)
-        self.renderer.show_current(df)
-        return df
+    def latest_for_station(self, station_id: str) -> Optional[WeatherRecord]:
+        series = self.repo.get_series(station_id)
+        return series.latest() if series else None
+
+
+class SimpleForecaster:
+    """
+    Mini "prévision" jouet (moyenne glissante précédente).
+    """
+    def forecast_next_temp(self, series: WeatherSeries, window: int = 3) -> Optional[float]:
+        vals: List[float] = [r.temperature_c for r in series.records if r.temperature_c is not None]
+        if len(vals) == 0:
+            return None
+        if len(vals) <= window:
+            return sum(vals) / len(vals)
+        return sum(vals[-window:]) / window
 
 
 class ForecastService:
-    def __init__(self, repo: IRepository, forecaster: IForecaster, renderer: IRenderer) -> None:
+    def __init__(self, repo: WeatherRepositoryMemory):
         self.repo = repo
-        self.forecaster = forecaster
-        self.renderer = renderer
+        self.model = SimpleForecaster()
 
-    def forecast_for(self, station: Station, horizon_hours: int = 6) -> pd.DataFrame:
-        df = self.repo.get_series(station.id)
-        fc = self.forecaster.forecast(df, horizon_hours=horizon_hours, freq="1H")
-        self.renderer.show_forecast(fc)
-        return fc
-
-
-class YDataSDKQuality:
-    def __init__(self, enabled: bool = _HAS_YDATA_SDK) -> None:
-        self.enabled = enabled
-
-    def quality_summary(self, df: pd.DataFrame) -> Dict[str, Any]:
-        if df.empty:
-            return {"rows": 0}
-        res: Dict[str, Any] = {}
-        res["rows"] = int(len(df))
-        res["missing_rate"] = float(df.isna().mean().mean())
-        res["duplicate_index"] = int(df.index.duplicated().sum())
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        res["numeric_cols"] = num_cols
-        if num_cols:
-            z = ((df[num_cols] - df[num_cols].mean()) / df[num_cols].std(ddof=0)).abs()
-            res["outlier_counts_z3"] = {c: int((z[c] > 3).sum()) for c in num_cols}
-            corr = df[num_cols].corr().abs()
-            upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-            redundant = [(i, j, float(upper.loc[i, j])) for i in upper.index for j in upper.columns if pd.notna(upper.loc[i, j]) and upper.loc[i, j] > 0.95]
-            res["redundant_pairs_abs>0.95"] = redundant
-        text_cols = df.select_dtypes(include=[object]).columns.tolist()
-        if text_cols:
-            invalid = {c: int(df[c].astype(str).str.strip().eq("").sum()) for c in text_cols}
-            res["empty_text_counts"] = invalid
-        return res
-
-    def synthesize(self, df: pd.DataFrame, n: int = 100) -> pd.DataFrame:
-        if df.empty or n <= 0:
-            return pd.DataFrame()
-        out = []
-        rng = np.random.default_rng(42)
-        for _ in range(n):
-            row: Dict[str, Any] = {}
-            for c in df.columns:
-                s = df[c]
-                if pd.api.types.is_numeric_dtype(s):
-                    mu = float(s.mean()) if s.notna().any() else 0.0
-                    sigma = float(s.std(ddof=0)) if s.notna().sum() > 1 else 1.0
-                    row[c] = float(rng.normal(mu, sigma))
-                else:
-                    vals = s.dropna().unique().tolist()
-                    row[c] = rng.choice(vals).item() if vals else None
-            out.append(row)
-        syn = pd.DataFrame(out)
-        if df.index.name is not None:
-            syn.index.name = df.index.name
-        return syn
+    def forecast_station_temp(self, station_id: str, window: int = 3) -> Optional[float]:
+        series = self.repo.get_series(station_id)
+        if not series:
+            return None
+        return self.model.forecast_next_temp(series, window=window)
 
 
-class DataProfiler:
-    def __init__(self, use_sdk: bool = _HAS_YDATA_SDK, use_profiling: bool = _HAS_PROFILING) -> None:
-        self.use_sdk = use_sdk
-        self.use_profiling = use_profiling
-        self.sdkq = YDataSDKQuality(enabled=use_sdk)
-
-    def profile(self, df: pd.DataFrame, out_html: str = "rapport.html", synthetic_rows: int = 0) -> Optional[str]:
-        q = self.sdkq.quality_summary(df)
-        print("\nQualité (résumé)", q)
-        if synthetic_rows > 0:
-            syn = self.sdkq.synthesize(df, n=synthetic_rows)
-            print(f"\nDonnées synthétiques générées: {len(syn)} lignes")
-        if self.use_profiling and not df.empty:
-            try:
-                profile = ProfileReport(df.reset_index(), title="Toulouse Météo — Profiling", minimal=True)
-                profile.to_file(out_html)
-                return os.path.abspath(out_html)
-            except Exception:
-                return None
-        return None
-
+# ==========================
+# CLI
+# ==========================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Toulouse météo — API only (OOP, SOLID)")
-    parser.add_argument("--metro", type=str, default="Capitole", help="Nom (partiel) de la station de métro Tisséo — défaut: Capitole")
-    parser.add_argument("--hours", type=int, default=24, help="Fenêtre d'historique à ingérer (heures)")
-    parser.add_argument("--forecast", type=int, default=6, help="Horizon de prévision (heures)")
-    parser.add_argument("--profile", action="store_true", help="Générer un rapport de profil (HTML) et un résumé qualité")
-    parser.add_argument("--synthetic", type=int, default=0, help="Nombre de lignes synthétiques à générer (0 = désactivé)")
-    parser.add_argument("--base-url", type=str, default="https://data.toulouse-metropole.fr", help="Base URL Opendatasoft")
-
-    args = parser.parse_args()
-
-    ds = OpendatasoftAPIDataSource(base_url=args.base_url)
-    cleaner = BasicCleaner()
+    ods = ODSClient(base_url=DEFAULT_BASE_URL)
     repo = WeatherRepositoryMemory()
-    renderer = SimpleRenderer()
-    catalog = StationCatalogSimple(ds)
-    catalog.load()
+    catalog = StationCatalogSimple(ods, repo)
 
-    metro = catalog.find_metro(args.metro)
-    if not metro:
-        raise SystemExit(f"Station métro introuvable pour la requête: {args.metro}")
-    print(f"Station métro sélectionnée: {metro.name} ({metro.latitude:.5f},{metro.longitude:.5f})")
+    try:
+        catalog.load()
+    except requests.HTTPError as e:
+        print("Erreur en chargeant le catalogue:", e)
+        raise
 
-    weather = catalog.nearest_weather_for(metro)
-    if not weather:
-        raise SystemExit("Aucune station météo disponible.")
-    print(f"Station météo la plus proche: {weather.name} #{weather.id.value} ({weather.latitude:.5f},{weather.longitude:.5f})")
+    ds_candidates = catalog.datasets()
+    SimpleRenderer.print_datasets(ds_candidates, max_rows=20)
 
-    ingest = WeatherIngestionService(ds, cleaner, repo, catalog)
-    df_clean = ingest.ingest_station(weather, hours=args.hours)
+    # Ingestion démo sur quelques datasets → juste pour montrer que ça tourne
+    cleaner = BasicCleaner()
+    ing = WeatherIngestionService(ods, repo, cleaner)
+    ing.ingest_all_latest(max_rows_per_station=3, max_stations=5)
 
-    query = WeatherQueryService(repo, renderer)
-    _ = query.show_current_for(weather)
+    # Affichage dernières obs (si dispo)
+    SimpleRenderer.print_latest(repo, max_rows=5)
 
-    fc_service = ForecastService(repo, SimpleForecaster(), renderer)
-    _ = fc_service.forecast_for(weather, horizon_hours=args.forecast)
-
-    if args.profile:
-        profiler = DataProfiler(use_sdk=_HAS_YDATA_SDK, use_profiling=_HAS_PROFILING)
-        out = profiler.profile(df_clean, out_html="rapport.html", synthetic_rows=args.synthetic)
-        if out:
-            print(f"\nProfil HTML: {out}")
+    # Démo forecast "moyenne" si on a des valeurs
+    fc = ForecastService(repo)
+    for st in repo.list_stations()[:3]:
+        yhat = fc.forecast_station_temp(st.id)
+        if yhat is not None:
+            print(f"Prévision jouet pour {st.name} → temp ≈ {yhat:.2f} °C")
 
 
 if __name__ == "__main__":
