@@ -78,3 +78,5 @@ Le programme affiche :
 * la **liste des stations météo** détectées,
 * leurs **dernières observations** (température, humidité, vent, pluie),
 * et une **petite prévision jouet** basée sur les dernières mesures.
+
+à faire extraction des données et intégration des données dns différents modèles (station & record)
