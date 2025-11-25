@@ -17,15 +17,10 @@
 from __future__ import annotations
 
 import os
-import sys
-import time
-import math
-import json
 import unicodedata
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
-
 import requests
 
 # ==============================
@@ -43,6 +38,8 @@ CATALOG_HARD_LIMIT = 10_000  # sécurité
 RECORDS_PAGE_SIZE = 100  # max autorisé pour records
 PRINT_WIDTH = 110
 
+JSONLike = dict[str, object]
+
 
 # ==============================
 # Helpers simples
@@ -58,7 +55,7 @@ def _norm(s: str) -> str:
     return s
 
 
-def _parse_datetime_any(x: Any) -> Optional[datetime]:
+def _parse_datetime_any(x: object | None) -> datetime | None:
     """Tente de parser divers formats date/datetime retournés par ODS."""
     if x is None:
         return None
@@ -102,20 +99,20 @@ class Station:
     id: str
     name: str
     dataset_id: str
-    meta: Dict[str, Any] = field(default_factory=dict)
+    meta: JSONLike = field(default_factory=dict)
 
 
 @dataclass
 class WeatherRecord:
     station_id: str
-    timestamp: Optional[datetime] = None
-    temperature_c: Optional[float] = None
-    humidity_pct: Optional[float] = None
-    pressure_hpa: Optional[float] = None
-    wind_speed_ms: Optional[float] = None
-    wind_dir_deg: Optional[float] = None
-    rain_mm: Optional[float] = None
-    raw: Dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime | None = None
+    temperature_c: float | None = None
+    humidity_pct: float | None = None
+    pressure_hpa: float | None = None
+    wind_speed_ms: float | None = None
+    wind_dir_deg: float | None = None
+    rain_mm: float | None = None
+    raw: JSONLike = field(default_factory=dict)
 
 
 # ==============================
@@ -124,23 +121,23 @@ class WeatherRecord:
 
 class WeatherRepositoryMemory:
     def __init__(self) -> None:
-        self._stations: Dict[str, Station] = {}
-        self._records: Dict[str, List[WeatherRecord]] = {}
+        self._stations: dict[str, Station] = {}
+        self._records: dict[str, list[WeatherRecord]] = {}
 
     def upsert_station(self, st: Station) -> None:
         self._stations[st.id] = st
         self._records.setdefault(st.id, [])
 
-    def get_station(self, station_id: str) -> Optional[Station]:
+    def get_station(self, station_id: str) -> Station | None:
         return self._stations.get(station_id)
 
-    def list_stations(self) -> List[Station]:
+    def list_stations(self) -> list[Station]:
         return list(self._stations.values())
 
     def add_record(self, station_id: str, rec: WeatherRecord) -> None:
         self._records.setdefault(station_id, []).append(rec)
 
-    def latest_records(self, station_id: str, n: int = 5) -> List[WeatherRecord]:
+    def latest_records(self, station_id: str, n: int = 5) -> list[WeatherRecord]:
         arr = self._records.get(station_id, [])
         arr = sorted(arr, key=lambda r: r.timestamp or datetime.min, reverse=True)
         return arr[:n]
@@ -161,7 +158,7 @@ class ODSClient:
 
     # --- HTTP core ---
 
-    def _request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
+    def _request(self, method: str, path: str, **kwargs) -> JSONLike:
         url = f"{self.base_url}{path}"
         resp = self.session.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
         # Lève si 4xx/5xx pour permettre un try/except côté appelant
@@ -179,7 +176,7 @@ class ODSClient:
         offset: int = 0,
         include_links: bool = False,
         include_app_metas: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> JSONLike:
         params = {
             "limit": max(1, min(limit, CATALOG_PAGE_SIZE)),
             "offset": max(0, offset),
@@ -188,7 +185,7 @@ class ODSClient:
         }
         return self._request("GET", "/catalog/datasets", params=params)
 
-    def catalog_datasets_iter(self, hard_limit: int = CATALOG_HARD_LIMIT) -> Generator[Dict[str, Any], None, None]:
+    def catalog_datasets_iter(self, hard_limit: int = CATALOG_HARD_LIMIT) -> Iterator[JSONLike]:
         """Page sur l'ensemble du catalogue, sans 'where' côté serveur pour éviter les 400."""
         total_yielded = 0
         offset = 0
@@ -209,19 +206,19 @@ class ODSClient:
 
     # --- Dataset info & records ---
 
-    def dataset_info(self, dataset_id: str) -> Dict[str, Any]:
+    def dataset_info(self, dataset_id: str) -> JSONLike:
         path = f"/catalog/datasets/{dataset_id}"
         return self._request("GET", path)
 
     def iter_records(
         self,
         dataset_id: str,
-        select: Optional[str] = None,
-        where: Optional[str] = None,
-        order_by: Optional[str] = None,
+        select: str | None = None,
+        where: str | None = None,
+        order_by: str | None = None,
         limit: int = RECORDS_PAGE_SIZE,
-        max_rows: Optional[int] = None,
-    ) -> Generator[Dict[str, Any], None, None]:
+        max_rows: int | None = None,
+    ) -> Iterator[JSONLike]:
         """
         Itère sur les records du dataset.
         NB: /records a un maximum de 100 par page. On page manuellement si max_rows > 100.
@@ -274,7 +271,7 @@ class BasicCleaner:
 
     TS_PREF = ["date_observation", "date_mesure", "date_heure", "date", "datetime", "timestamp", "heure", "time"]
 
-    def _get_first(self, data: Dict[str, Any], keys: List[str]) -> Optional[Any]:
+    def _get_first(self, data: JSONLike, keys: list[str]) -> object | None:
         keys_norm = [_norm(k) for k in data.keys()]
         mapping = {kn: k for k, kn in zip(data.keys(), keys_norm)}
         for kk in keys:
@@ -289,7 +286,7 @@ class BasicCleaner:
                     return data[orig]
         return None
 
-    def _to_float(self, x: Any) -> Optional[float]:
+    def _to_float(self, x: object | None) -> float | None:
         if x is None or x == "":
             return None
         try:
@@ -297,7 +294,7 @@ class BasicCleaner:
         except ValueError:
             return None
 
-    def clean(self, raw: Dict[str, Any], station_id: str) -> WeatherRecord:
+    def clean(self, raw: JSONLike, station_id: str) -> WeatherRecord:
         # Timestamp
         ts_raw = self._get_first(raw, self.TS_PREF)
         ts = _parse_datetime_any(ts_raw)
@@ -352,9 +349,9 @@ class StationCatalogSimple:
     def __init__(self, ods: ODSClient, repo: WeatherRepositoryMemory) -> None:
         self.ods = ods
         self.repo = repo
-        self._weather: List[Dict[str, Any]] = []
+        self._weather: list[JSONLike] = []
 
-    def _is_weather_like(self, ds: Dict[str, Any]) -> bool:
+    def _is_weather_like(self, ds: JSONLike) -> bool:
         fields = ds.get("fields", []) or []
         fields_text = " ".join(
             f"{_norm(f.get('name') or '')} {_norm(f.get('label') or '')}"
@@ -377,7 +374,7 @@ class StationCatalogSimple:
     def load(self) -> None:
         print("Chargement du catalogue (détection datasets météo)…")
         # Pas de 'where' côté serveur -> pagination full + filtre local
-        items: List[Dict[str, Any]] = []
+        items: list[JSONLike] = []
         for ds in self.ods.catalog_datasets_iter(hard_limit=CATALOG_HARD_LIMIT):
             if self._is_weather_like(ds):
                 items.append(ds)
@@ -393,7 +390,7 @@ class StationCatalogSimple:
             st = Station(id=dsid, name=title, dataset_id=dsid, meta=metas)
             self.repo.upsert_station(st)
 
-    def datasets(self) -> List[Dict[str, Any]]:
+    def datasets(self) -> list[JSONLike]:
         return list(self._weather)
 
 
@@ -407,7 +404,7 @@ class WeatherIngestionService:
         self.repo = repo
         self.cleaner = cleaner
 
-    def _find_first_date_field(self, dataset_id: str) -> Optional[str]:
+    def _find_first_date_field(self, dataset_id: str) -> str | None:
         info = self.ods.dataset_info(dataset_id)
         fields = (info.get("fields") or [])
         # priorité aux champs nommés logiquement
@@ -455,7 +452,7 @@ class WeatherQueryService:
     def __init__(self, repo: WeatherRepositoryMemory) -> None:
         self.repo = repo
 
-    def latest_for_station(self, station_id: str, n: int = 1) -> List[WeatherRecord]:
+    def latest_for_station(self, station_id: str, n: int = 1) -> list[WeatherRecord]:
         return self.repo.latest_records(station_id, n=n)
 
 
@@ -464,7 +461,7 @@ class ForecastService:
     def __init__(self, repo: WeatherRepositoryMemory) -> None:
         self.repo = repo
 
-    def forecast_station_temp(self, station_id: str, last_n: int = 3) -> Optional[float]:
+    def forecast_station_temp(self, station_id: str, last_n: int = 3) -> float | None:
         rows = self.repo.latest_records(station_id, n=last_n)
         temps = [r.temperature_c for r in rows if r.temperature_c is not None]
         if not temps:
@@ -478,7 +475,7 @@ class ForecastService:
 
 class SimpleRenderer:
     @staticmethod
-    def print_datasets(datasets: List[Dict[str, Any]], max_rows: int = 20) -> None:
+    def print_datasets(datasets: list[JSONLike], max_rows: int = 20) -> None:
         print("\n=== Candidats 'météo' détectés dans le catalogue ===")
         if not datasets:
             print("(aucun dataset météo détecté via analyse des champs)")
