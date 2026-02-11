@@ -17,6 +17,7 @@ Application Python permettant de consulter les données météorologiques en tem
 3. **Affichage détaillé** : observations récentes + prévision
 4. **Carrousel automatique** parcourant toutes les stations
 5. **Structures de données personnalisées** (liste chaînée, file, table de hachage)
+6. **Tests unitaires** complets (187 tests, 16 fichiers de tests)
 
 ---
 
@@ -24,33 +25,34 @@ Application Python permettant de consulter les données météorologiques en tem
 
 ### ✅ Critères Respectés
 
-| Critère                          | Localisation dans le Code                       | Statut |
-| -------------------------------- | ----------------------------------------------- | ------ |
-| **Exécution sans erreur**        | `python meteo_toulouse_app.py` fonctionne       | ✅     |
-| **Principe SOLID**               | Classes séparées (Repository, Services, Client) | ✅     |
-| **Principe KISS**                | Code simple et lisible                          | ✅     |
-| **Principe DRY**                 | Pas de duplication, méthodes réutilisables      | ✅     |
-| **Principe YAGNI**               | Toutes classes/méthodes sont utilisées          | ✅     |
-| **Documentation jeu de données** | Voir section "Datasets Utilisés" ci-dessous     | ✅     |
-| **Documentation du code**        | Docstrings complètes + typage Python 3.12+      | ✅     |
-| **Documentation utilisation**    | Ce README complet                               | ✅     |
-| **Récupérer météo en ligne**     | `ODSClient` + `WeatherIngestionService`         | ✅     |
-| **Afficher la météo**            | `SimpleRenderer` + `StationSelectorMenu`        | ✅     |
-| **Structuration projet**         | Voir "Architecture du Code" ci-dessous          | ✅     |
-| **Liste chaînée**                | `LinkedList` (lignes 85-210)                    | ✅     |
-| **File (Queue)**                 | `Queue` (lignes 213-310)                        | ✅     |
-| **Dictionnaire**                 | `HashMap` avec chaînage (lignes 313-480)        | ✅     |
-| **Doc structures complexes**     | Docstrings "Structure de données: ..."          | ✅     |
-| **Respect PEP8**                 | snake_case, CamelCase, conventions Python       | ✅     |
-| **≥3 Design Patterns**           | Voir "Design Patterns Utilisés" ci-dessous      | ✅     |
+| Critère                          | Localisation dans le Code                                     | Statut |
+| -------------------------------- | ------------------------------------------------------------- | ------ |
+| **Exécution sans erreur**        | `python run.py` fonctionne                                    | ✅     |
+| **Principe SOLID**               | Modules séparés (Repository, Services, Client, UI)            | ✅     |
+| **Principe KISS**                | Code simple et lisible                                        | ✅     |
+| **Principe DRY**                 | Pas de duplication, méthodes réutilisables                    | ✅     |
+| **Principe YAGNI**               | Toutes classes/méthodes sont utilisées                        | ✅     |
+| **Documentation jeu de données** | Voir section "Datasets Utilisés" ci-dessous                   | ✅     |
+| **Documentation du code**        | Docstrings complètes + typage Python 3.12+                    | ✅     |
+| **Documentation utilisation**    | Ce README complet                                             | ✅     |
+| **Récupérer météo en ligne**     | `client.py` + `services/ingestion.py`                         | ✅     |
+| **Afficher la météo**            | `ui/renderer.py` + `ui/menu.py`                               | ✅     |
+| **Structuration projet**         | Architecture modulaire avec packages                          | ✅     |
+| **Liste chaînée**                | `data_structures/linked_list.py`                              | ✅     |
+| **File (Queue)**                 | `data_structures/queue.py`                                    | ✅     |
+| **Dictionnaire**                 | `data_structures/hash_map.py` (chaînage)                      | ✅     |
+| **Doc structures complexes**     | Docstrings "Structure de données: ..."                        | ✅     |
+| **Respect PEP8**                 | snake_case, CamelCase, conventions Python                     | ✅     |
+| **≥3 Design Patterns**           | 6 patterns (voir ci-dessous)                                  | ✅     |
+| **Tests unitaires**              | 187 tests dans `tests/` (1 fichier par module)                | ✅     |
 
 ### 📊 Tests & Qualité
 
-| Critère                | Statut                  |
-| ---------------------- | ----------------------- |
-| Tests unitaires        | À compléter (optionnel) |
-| PyLint                 | À exécuter (optionnel)  |
-| Facilité d'utilisation | Menu interactif complet |
+| Critère                | Statut                          |
+| ---------------------- | ------------------------------- |
+| Tests unitaires        | ✅ 187 tests (16 fichiers)      |
+| Couverture             | `pytest --cov=meteo_toulouse`   |
+| Facilité d'utilisation | Menu interactif complet         |
 
 ---
 
@@ -59,20 +61,23 @@ Application Python permettant de consulter les données météorologiques en tem
 ### Prérequis
 
 - **Python 3.12+** (obligatoire pour le typage moderne)
-- Modules Python :
+
+### Installation des dépendances
 
 ```bash
-pip install requests
-```
+# Dépendances de production
+pip install -r requirements.txt
 
-> **Note:** Les modules `pandas`, `python-dateutil` et `rich` ne sont plus nécessaires.
+# Dépendances de développement (tests)
+pip install -r requirements-dev.txt
+```
 
 ### Lancer l'Application
 
 #### Option 1 : Lancement Standard (Recommandé)
 
 ```bash
-python meteo_toulouse_app.py
+python run.py
 ```
 
 #### Option 2 : Mode Station Unique (Debug/Test)
@@ -80,10 +85,10 @@ python meteo_toulouse_app.py
 ```bash
 # Windows PowerShell
 $env:ODS_DATASET_ID="37-station-meteo-toulouse-universite-paul-sabatier"
-python meteo_toulouse_app.py
+python run.py
 
 # Linux/Mac/Git Bash
-ODS_DATASET_ID="37-station-meteo-toulouse-universite-paul-sabatier" python meteo_toulouse_app.py
+ODS_DATASET_ID="37-station-meteo-toulouse-universite-paul-sabatier" python run.py
 ```
 
 **IDs de stations disponibles:**
@@ -92,6 +97,16 @@ ODS_DATASET_ID="37-station-meteo-toulouse-universite-paul-sabatier" python meteo
 - `04-station-meteo-toulouse-ile-empalot`
 - `01-station-meteo-toulouse-meteopole`
 - `45-station-meteo-toulouse-st-exupery`
+
+### Lancer les Tests
+
+```bash
+# Tous les tests
+pytest tests/ -v
+
+# Avec couverture de code
+pytest tests/ --cov=meteo_toulouse --cov-report=term-missing
+```
 
 ---
 
@@ -154,59 +169,82 @@ Votre choix: C
 
 ## 📁 Architecture du Code
 
-### Structure du Fichier `meteo_toulouse_app.py`
-
-Le fichier unique contient **~1100 lignes** organisées en sections :
+### Structure Modulaire
 
 ```
-meteo_toulouse_app.py (1100 lignes)
+ALGO_DEV_DATA/
 │
-├── CONSTANTES ET CONFIGURATION (lignes 1-70)
-│   └── Configuration centralisée dans APP_CONFIG
+├── meteo_toulouse/                     # Package principal
+│   ├── __init__.py                     # Package marker + version
+│   ├── config.py                       # Constantes, TypeVars, APP_CONFIG
+│   │
+│   ├── data_structures/                # Structures de données personnalisées
+│   │   ├── __init__.py
+│   │   ├── linked_list.py             # ListNode[T] + LinkedList[T]
+│   │   ├── queue.py                   # Queue[T] (FIFO)
+│   │   └── hash_map.py               # HashEntry[K,V] + HashMap[K,V]
+│   │
+│   ├── utils.py                       # norm(), parse_datetime_any()
+│   ├── models.py                      # Station, WeatherRecord (dataclasses)
+│   ├── repository.py                  # WeatherRepositoryMemory (Repository Pattern)
+│   ├── client.py                      # ODSClient (Adapter Pattern)
+│   ├── cleaner.py                     # BasicCleaner (Factory Pattern)
+│   │
+│   ├── services/                      # Services métier (Service Layer Pattern)
+│   │   ├── __init__.py
+│   │   ├── catalog.py                 # StationCatalogSimple
+│   │   ├── ingestion.py               # WeatherIngestionService
+│   │   ├── query.py                   # WeatherQueryService
+│   │   └── forecast.py                # ForecastService
+│   │
+│   ├── ui/                            # Interface utilisateur
+│   │   ├── __init__.py
+│   │   ├── renderer.py               # SimpleRenderer (Strategy Pattern)
+│   │   ├── carousel.py               # StationCarouselRenderer (utilise Queue)
+│   │   └── menu.py                   # StationSelectorMenu (Command Pattern)
+│   │
+│   └── app.py                         # main() : orchestration
 │
-├── STRUCTURES DE DONNÉES PERSONNALISÉES (lignes 71-480)
-│   ├── LinkedList[T] (liste chaînée générique)
-│   ├── Queue[T] (file FIFO basée sur LinkedList)
-│   └── HashMap[K, V] (table de hachage avec chaînage)
+├── tests/                             # Tests unitaires (1 fichier par module)
+│   ├── __init__.py
+│   ├── test_linked_list.py            # Tests LinkedList (28 tests)
+│   ├── test_queue.py                  # Tests Queue (16 tests)
+│   ├── test_hash_map.py               # Tests HashMap (21 tests)
+│   ├── test_utils.py                  # Tests utilitaires (18 tests)
+│   ├── test_models.py                 # Tests dataclasses (8 tests)
+│   ├── test_repository.py             # Tests repository (10 tests)
+│   ├── test_client.py                 # Tests HTTP client (10 tests)
+│   ├── test_cleaner.py                # Tests cleaner (11 tests)
+│   ├── test_catalog.py                # Tests catalogue (7 tests)
+│   ├── test_ingestion.py              # Tests ingestion (7 tests)
+│   ├── test_query.py                  # Tests query (3 tests)
+│   ├── test_forecast.py               # Tests prévisions (5 tests)
+│   ├── test_renderer.py               # Tests affichage (7 tests)
+│   ├── test_carousel.py               # Tests carrousel (7 tests)
+│   ├── test_menu.py                   # Tests menu (8 tests)
+│   └── test_config.py                 # Tests configuration (7 tests)
 │
-├── UTILITAIRES (lignes 481-570)
-│   ├── _norm() : normalisation de texte
-│   └── _parse_datetime_any() : parsing dates multiformats
-│
-├── MODÈLES DE DOMAINE (lignes 571-620)
-│   ├── Station (dataclass)
-│   └── WeatherRecord (dataclass)
-│
-├── REPOSITORY (lignes 621-680)
-│   └── WeatherRepositoryMemory (utilise HashMap)
-│
-├── CLIENT HTTP ODS (lignes 681-800)
-│   └── ODSClient (abstraction API Toulouse Métropole)
-│
-├── SERVICES MÉTIER (lignes 801-1000)
-│   ├── BasicCleaner (Factory Pattern)
-│   ├── StationCatalogSimple (utilise LinkedList)
-│   ├── WeatherIngestionService
-│   ├── WeatherQueryService
-│   └── ForecastService
-│
-├── INTERFACE UTILISATEUR (lignes 1001-1080)
-│   ├── SimpleRenderer (Strategy Pattern)
-│   ├── StationCarouselRenderer (utilise Queue)
-│   └── StationSelectorMenu (Command Pattern)
-│
-└── FONCTION PRINCIPALE (lignes 1081-1120)
-    └── main() : orchestration de l'application
+├── run.py                             # Point d'entrée : python run.py
+├── requirements.txt                   # Dépendance: requests
+├── requirements-dev.txt               # + pytest, pytest-cov
+└── README.md                          # Ce fichier
 ```
 
-### Pourquoi un Fichier Unique ?
+### Organisation en Couches
 
-- ✅ **Facilite la correction** : tout le code au même endroit
-- ✅ **Pas de problèmes d'imports** : pas de dépendances entre modules
-- ✅ **Exécution simple** : `python meteo_toulouse_app.py`
-- ✅ **Respect des critères** : structuration claire en sections commentées
+L'architecture suit une organisation en couches avec des dépendances unidirectionnelles :
 
-> **Note:** Le plan original prévoyait une architecture modulaire avec packages (`meteo_toulouse/`), mais un fichier unique est plus adapté pour l'évaluation.
+```
+config.py  →  data_structures/  →  models.py  →  repository.py
+                                        ↓              ↓
+                   utils.py  →  cleaner.py    client.py
+                                        ↓         ↓
+                                   services/
+                                        ↓
+                                      ui/
+                                        ↓
+                                     app.py
+```
 
 ---
 
@@ -214,7 +252,7 @@ meteo_toulouse_app.py (1100 lignes)
 
 ### 1. Liste Chaînée (`LinkedList[T]`)
 
-**Localisation:** Lignes 85-210
+**Localisation:** `meteo_toulouse/data_structures/linked_list.py`
 
 **Caractéristiques:**
 
@@ -228,23 +266,11 @@ meteo_toulouse_app.py (1100 lignes)
 - Stockage des datasets météo dans `StationCatalogSimple._weather`
 - Base pour les buckets du `HashMap` (chaînage des collisions)
 
-**Documentation:**
-
-```python
-class LinkedList(Generic[T]):
-    """
-    Structure de données: Liste Chaînée (Linked List)
-
-    Implementation d'une liste chaînée simple avec opérations de base.
-    [...]
-    """
-```
-
 ---
 
 ### 2. File (`Queue[T]`)
 
-**Localisation:** Lignes 213-310
+**Localisation:** `meteo_toulouse/data_structures/queue.py`
 
 **Caractéristiques:**
 
@@ -258,24 +284,11 @@ class LinkedList(Generic[T]):
 - Gestion du carrousel de stations dans `StationCarouselRenderer`
 - Méthode `rotate()` pour parcours cyclique infini
 
-**Documentation:**
-
-```python
-class Queue(Generic[T]):
-    """
-    Structure de données: File (Queue) - First In, First Out
-
-    Implementation d'une file basée sur une liste chaînée.
-    Utilisée pour le carrousel de stations météo (parcours cyclique).
-    [...]
-    """
-```
-
 ---
 
 ### 3. Table de Hachage (`HashMap[K, V]`)
 
-**Localisation:** Lignes 313-480
+**Localisation:** `meteo_toulouse/data_structures/hash_map.py`
 
 **Caractéristiques:**
 
@@ -290,21 +303,6 @@ class Queue(Generic[T]):
 
 - `WeatherRepositoryMemory._stations`: `HashMap[str, Station]`
 - `WeatherRepositoryMemory._records`: `HashMap[str, LinkedList[WeatherRecord]]`
-
-**Documentation:**
-
-```python
-class HashMap(Generic[K, V]):
-    """
-    Structure de données: Table de Hachage (HashMap) avec Chaînage
-
-    Implementation d'un dictionnaire utilisant une table de hachage
-    avec gestion des collisions par chaînage (listes chaînées).
-
-    Chaque bucket contient une LinkedList d'entrées (HashEntry).
-    [...]
-    """
-```
 
 **Démonstration de la composition:**
 Le `HashMap` réutilise `LinkedList`, démontrant la composition de structures de données :
@@ -321,7 +319,7 @@ self._buckets: list[LinkedList[HashEntry[K, V]]] = [
 
 ### 1. Repository Pattern ✅
 
-**Classe:** `WeatherRepositoryMemory` (lignes 621-680)
+**Fichier:** `meteo_toulouse/repository.py`
 
 **Description:** Encapsule la logique de stockage des stations et observations.
 
@@ -330,26 +328,15 @@ self._buckets: list[LinkedList[HashEntry[K, V]]] = [
 - Abstraction de la persistance (peut être remplacé par une DB sans changer le code métier)
 - Centralisation des requêtes de données
 
-**Code:**
-
-```python
-class WeatherRepositoryMemory:
-    """Repository Pattern: Stockage en mémoire des stations et observations."""
-
-    def __init__(self) -> None:
-        self._stations: HashMap[str, Station] = HashMap()
-        self._records: HashMap[str, LinkedList[WeatherRecord]] = HashMap()
-```
-
 ---
 
 ### 2. Service Layer Pattern ✅
 
-**Classes:**
+**Fichiers:**
 
-- `WeatherIngestionService` (lignes 850-920)
-- `WeatherQueryService` (lignes 922-930)
-- `ForecastService` (lignes 932-955)
+- `meteo_toulouse/services/ingestion.py` — `WeatherIngestionService`
+- `meteo_toulouse/services/query.py` — `WeatherQueryService`
+- `meteo_toulouse/services/forecast.py` — `ForecastService`
 
 **Description:** Séparation de la logique métier en services dédiés.
 
@@ -363,7 +350,7 @@ class WeatherRepositoryMemory:
 
 ### 3. Client/Adapter Pattern ✅
 
-**Classe:** `ODSClient` (lignes 681-800)
+**Fichier:** `meteo_toulouse/client.py`
 
 **Description:** Adapte l'API HTTP Opendatasoft à une interface Python simple.
 
@@ -377,7 +364,7 @@ class WeatherRepositoryMemory:
 
 ### 4. Factory Pattern ✅
 
-**Classe:** `BasicCleaner` (lignes 805-850)
+**Fichier:** `meteo_toulouse/cleaner.py`
 
 **Description:** Transforme les données brutes JSON en objets `WeatherRecord`.
 
@@ -391,11 +378,10 @@ class WeatherRepositoryMemory:
 
 ### 5. Strategy Pattern ✅
 
-**Classes:**
+**Fichiers:**
 
-- `SimpleRenderer` (lignes 960-1020)
-- `StationCarouselRenderer` (lignes 1025-1080)
-- `StationSelectorMenu` (lignes 1085-1200)
+- `meteo_toulouse/ui/renderer.py` — `SimpleRenderer`
+- `meteo_toulouse/ui/carousel.py` — `StationCarouselRenderer`
 
 **Description:** Différentes stratégies d'affichage des données météo.
 
@@ -408,7 +394,7 @@ class WeatherRepositoryMemory:
 
 ### 6. Command Pattern ✅
 
-**Classe:** `StationSelectorMenu` (lignes 1085-1200)
+**Fichier:** `meteo_toulouse/ui/menu.py`
 
 **Description:** Chaque action du menu est une commande (consulter, rechercher, carrousel).
 
@@ -495,42 +481,27 @@ Le `BasicCleaner` gère les variations de nommage :
 
 ## 🧪 Tests et Qualité du Code
 
-### Tests Unitaires (Optionnel)
+### Tests Unitaires
 
-Pour ajouter les tests :
-
-```bash
-pip install pytest pytest-cov
-```
-
-Créer `test_data_structures.py` :
-
-```python
-import pytest
-from meteo_toulouse_app import LinkedList, Queue, HashMap
-
-def test_linked_list():
-    ll = LinkedList()
-    ll.append(1)
-    ll.append(2)
-    assert len(ll) == 2
-    assert 1 in ll
-
-# ... autres tests
-```
-
-Exécution :
+Le projet inclut **187 tests unitaires** répartis en **16 fichiers** (1 par module).
 
 ```bash
-pytest --cov=meteo_toulouse_app --cov-report=term-missing
+# Installation
+pip install -r requirements-dev.txt
+
+# Lancer les tests
+pytest tests/ -v
+
+# Avec couverture
+pytest tests/ --cov=meteo_toulouse --cov-report=term-missing
 ```
 
-### PyLint (Optionnel)
+**Stratégie de test:**
 
-```bash
-pip install pylint
-pylint meteo_toulouse_app.py
-```
+- **Structures de données** : tests exhaustifs (append, remove, resize, collisions...)
+- **Services** : mocks HTTP avec `unittest.mock.patch`
+- **UI** : capture stdout avec `capsys` (pytest)
+- **Menu** : mock de `input()` pour simuler les interactions
 
 ---
 
@@ -540,9 +511,9 @@ pylint meteo_toulouse_app.py
 
 **Principes de Programmation:**
 
-- ✅ SOLID : séparation Repository/Services/Client
+- ✅ SOLID : modules séparés par responsabilité
 - ✅ KISS : code simple et lisible
-- ✅ DRY : méthodes réutilisables (`_norm`, `_get_first`)
+- ✅ DRY : méthodes réutilisables (`norm`, `_get_first`)
 - ✅ YAGNI : pas de code inutilisé
 
 **Documentation:**
@@ -558,20 +529,22 @@ pylint meteo_toulouse_app.py
 
 **Structures de Données:**
 
-- ✅ Liste chaînée : `LinkedList[T]` (lignes 85-210)
-- ✅ File : `Queue[T]` (lignes 213-310)
-- ✅ Dictionnaire : `HashMap[K, V]` (lignes 313-480)
+- ✅ Liste chaînée : `LinkedList[T]` — `data_structures/linked_list.py`
+- ✅ File : `Queue[T]` — `data_structures/queue.py`
+- ✅ Dictionnaire : `HashMap[K, V]` — `data_structures/hash_map.py`
 
 **Architecture:**
 
-- ✅ Structuration : sections commentées dans le fichier
+- ✅ Structuration modulaire : 3 sous-packages, 16 modules
 - ✅ PEP8 : nommage snake_case / CamelCase
 
 **Design Patterns:**
 
 - ✅ 6 patterns identifiés et documentés
 
----
+**Tests:**
+
+- ✅ 187 tests unitaires (16 fichiers, 1 par module)
 
 ---
 
@@ -586,12 +559,13 @@ pylint meteo_toulouse_app.py
 ## 📧 Contact
 
 **Étudiant:** Lucas Madjinda
-**Fichier principal:** `meteo_toulouse_app.py`
-**Date:** Janvier 2026
+**Point d'entrée:** `python run.py`
+**Date:** Février 2026
 
 ---
 
 **Note:**
 Tous les critères sont implémentés et documentés.
-Le code est prêt à l'exécution avec `python meteo_toulouse_app.py`.
+Le code est prêt à l'exécution avec `python run.py`.
 Les structures de données personnalisées sont utilisées dans tout le projet (pas de `list`/`dict` natifs pour le stockage).
+Les tests passent tous avec `pytest tests/ -v`.
