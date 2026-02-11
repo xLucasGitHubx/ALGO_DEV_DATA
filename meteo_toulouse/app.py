@@ -12,7 +12,7 @@ import requests
 from meteo_toulouse.config import APP_CONFIG, PRINT_WIDTH
 from meteo_toulouse.models import Station
 from meteo_toulouse.client import ODSClient
-from meteo_toulouse.repository import WeatherRepositoryMemory
+from meteo_toulouse.repository_cached import CachedWeatherRepository
 from meteo_toulouse.cleaner import BasicCleaner
 from meteo_toulouse.services.catalog import StationCatalogSimple
 from meteo_toulouse.services.ingestion import WeatherIngestionService
@@ -27,19 +27,18 @@ def main() -> None:
     Point d'entree principal de l'application.
 
     Workflow:
-    1. Initialise les composants (client, repository, services)
+    1. Initialise les composants (client, repository avec cache, services)
     2. Charge le catalogue des stations meteo
-    3. Ingere les observations recentes
-    4. Lance le menu interactif
+    3. Lance le menu interactif (chargement des observations a la demande)
     """
     print("=" * PRINT_WIDTH)
     print("     APPLICATION METEO TOULOUSE METROPOLE")
     print("     Structures de donnees: LinkedList, Queue, HashMap")
     print("=" * PRINT_WIDTH)
 
-    # Initialisation des composants
+    # Initialisation des composants (avec cache TTL de 5 minutes)
     ods = ODSClient()
-    repo = WeatherRepositoryMemory()
+    repo = CachedWeatherRepository(ttl_seconds=300)
     catalog = StationCatalogSimple(ods, repo)
 
     # Option: forcer un dataset via variable d'environnement
@@ -74,21 +73,10 @@ def main() -> None:
         print("Aucune station meteo trouvee dans le catalogue.")
         sys.exit(0)
 
-    # Ingestion des observations
-    print("\nIngestion des observations recentes...")
+    # Preparation des services (ingestion a la demande)
+    print("\nMode chargement a la demande active (donnees fraiches a chaque consultation).")
     cleaner = BasicCleaner()
     ing = WeatherIngestionService(ods, repo, cleaner)
-
-    ingestion_cfg = APP_CONFIG.get("ingestion") or {}
-    max_rows_per_station = int(ingestion_cfg.get("max_rows_per_station", 5))
-    max_stations_value = ingestion_cfg.get("max_stations")
-    max_stations = int(max_stations_value) if isinstance(max_stations_value, int) else None
-
-    total_rows = ing.ingest_all_latest(
-        max_rows_per_station=max_rows_per_station,
-        max_stations=max_stations,
-    )
-    print(f"Ingestion terminee: {total_rows} observations chargees.")
 
     # Services
     fc = ForecastService(repo)
@@ -102,7 +90,8 @@ def main() -> None:
         repo=repo,
         forecast=fc,
         query=query_svc,
-        carousel_delay=carousel_delay
+        carousel_delay=carousel_delay,
+        ingestion_service=ing
     )
     menu.run()
 

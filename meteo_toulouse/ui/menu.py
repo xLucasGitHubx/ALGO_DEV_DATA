@@ -10,6 +10,7 @@ from meteo_toulouse.utils import norm
 from meteo_toulouse.repository import WeatherRepositoryMemory
 from meteo_toulouse.services.forecast import ForecastService
 from meteo_toulouse.services.query import WeatherQueryService
+from meteo_toulouse.services.ingestion import WeatherIngestionService
 from meteo_toulouse.ui.renderer import SimpleRenderer
 from meteo_toulouse.ui.carousel import StationCarouselRenderer
 
@@ -23,6 +24,10 @@ class StationSelectorMenu:
     - Consulter une station specifique par numero
     - Rechercher une station par nom
     - Lancer le carrousel
+
+    Avec chargement a la demande:
+    Les observations d'une station ne sont chargees que lors de la consultation,
+    permettant un demarrage rapide et des donnees toujours fraiches.
     """
 
     def __init__(
@@ -30,12 +35,14 @@ class StationSelectorMenu:
         repo: WeatherRepositoryMemory,
         forecast: ForecastService,
         query: WeatherQueryService,
-        carousel_delay: int = 5
+        carousel_delay: int = 5,
+        ingestion_service: WeatherIngestionService | None = None
     ) -> None:
         self.repo = repo
         self.forecast = forecast
         self.query = query
         self.carousel_delay = carousel_delay
+        self._ingestion = ingestion_service
         self._stations_list: list[Station] = []
 
     def _refresh_stations(self) -> None:
@@ -88,7 +95,31 @@ class StationSelectorMenu:
         return results
 
     def _show_station_detail(self, station: Station) -> None:
-        """Affiche le detail d'une station."""
+        """Affiche le detail d'une station.
+
+        Si le service d'ingestion est disponible, charge les observations
+        a la demande avant l'affichage (avec support du cache TTL).
+        """
+        # Chargement a la demande des observations
+        if self._ingestion:
+            # Verifier si le cache est valide (si repository supporte le cache)
+            needs_load = True
+            if hasattr(self.repo, 'needs_refresh'):
+                needs_load = self.repo.needs_refresh(station.id)
+                if not needs_load:
+                    print(f"\n[Cache] Utilisation des donnees en cache pour '{station.name}'")
+
+            if needs_load:
+                print(f"\n[Chargement] Recuperation des observations pour '{station.name}'...")
+                try:
+                    count = self._ingestion.ingest_latest(station, max_rows=5)
+                    if hasattr(self.repo, 'mark_refreshed'):
+                        self.repo.mark_refreshed(station.id)
+                    print(f"[OK] {count} observation(s) chargee(s).")
+                except Exception as e:
+                    print(f"[Erreur] Impossible de charger les observations: {e}")
+                    return
+
         records = self.query.latest_for_station(station.id, n=5)
         forecast_temp = self.forecast.forecast_station_temp(station.id)
         SimpleRenderer.print_station_detail(station, records, forecast_temp)

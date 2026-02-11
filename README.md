@@ -15,9 +15,9 @@ Application Python permettant de consulter les données météorologiques en tem
 1. **Menu interactif** pour consulter facilement une station spécifique
 2. **Recherche de stations** par nom (recherche partielle)
 3. **Affichage détaillé** : observations récentes + prévision
-4. **Carrousel automatique** parcourant toutes les stations
+4. **Chargement à la demande** : données fraîches à chaque consultation avec cache TTL (5 min)
 5. **Structures de données personnalisées** (liste chaînée, file, table de hachage)
-6. **Tests unitaires** complets (187 tests, 16 fichiers de tests)
+6. **Tests unitaires** complets (200+ tests, 17 fichiers de tests)
 
 ---
 
@@ -32,6 +32,7 @@ Application Python permettant de consulter les données météorologiques en tem
 | **Principe KISS**                | Code simple et lisible                             | ✅     |
 | **Principe DRY**                 | Pas de duplication, méthodes réutilisables         | ✅     |
 | **Principe YAGNI**               | Toutes classes/méthodes sont utilisées             | ✅     |
+| **Chargement à la demande**      | Cache TTL + ingestion lazy (v2.0)                  | ✅     |
 | **Documentation jeu de données** | Voir section "Datasets Utilisés" ci-dessous        | ✅     |
 | **Documentation du code**        | Docstrings complètes + typage Python 3.12+         | ✅     |
 | **Documentation utilisation**    | Ce README complet                                  | ✅     |
@@ -44,15 +45,16 @@ Application Python permettant de consulter les données météorologiques en tem
 | **Doc structures complexes**     | Docstrings "Structure de données: ..."             | ✅     |
 | **Respect PEP8**                 | snake_case, CamelCase, conventions Python          | ✅     |
 | **≥3 Design Patterns**           | 6 patterns (voir ci-dessous)                       | ✅     |
-| **Tests unitaires**              | 187 tests dans `tests/` (1 fichier par module)     | ✅     |
+| **Tests unitaires**              | 200+ tests dans `tests/` (1 fichier par module)    | ✅     |
 
 ### 📊 Tests & Qualité
 
 | Critère                | Statut                        |
 | ---------------------- | ----------------------------- |
-| Tests unitaires        | ✅ 187 tests (16 fichiers)    |
+| Tests unitaires        | ✅ 200+ tests (17 fichiers)   |
 | Couverture             | `pytest --cov=meteo_toulouse` |
 | Facilité d'utilisation | Menu interactif complet       |
+| Performance            | Démarrage <2s (lazy loading)  |
 
 ---
 
@@ -82,6 +84,8 @@ pip install pylint
 ```bash
 python run.py
 ```
+
+**Nouveauté v2.0 :** L'application démarre maintenant en **<2 secondes** grâce au chargement à la demande ! Les observations de chaque station sont chargées uniquement lors de la consultation, garantissant des données toujours fraîches avec un cache de 5 minutes pour optimiser les performances.
 
 #### Option 2 : Mode Station Unique (Debug/Test)
 
@@ -163,13 +167,15 @@ Entrez le nom (ou partie du nom): basso
 
 → Trouve "Station météo Toulouse Basso Cambo"
 
-**3. Carrousel automatique:**
+**3. Afficher toutes les observations:**
 
 ```
-Votre choix: C
+Votre choix: A
 ```
 
-→ Parcourt toutes les stations toutes les 5 secondes (Ctrl+C pour arrêter)
+→ Affiche un résumé de toutes les stations avec leurs dernières observations
+
+**Note :** Le carrousel automatique est désactivé par défaut pour optimiser le chargement à la demande. Il peut être réactivé dans `config.py` si nécessaire.
 
 ---
 
@@ -193,6 +199,7 @@ ALGO_DEV_DATA/
 │   ├── utils.py                       # norm(), parse_datetime_any()
 │   ├── models.py                      # Station, WeatherRecord (dataclasses)
 │   ├── repository.py                  # WeatherRepositoryMemory (Repository Pattern)
+│   ├── repository_cached.py           # CachedWeatherRepository (cache TTL)
 │   ├── client.py                      # ODSClient (Adapter Pattern)
 │   ├── cleaner.py                     # BasicCleaner (Factory Pattern)
 │   │
@@ -219,6 +226,7 @@ ALGO_DEV_DATA/
 │   ├── test_utils.py                  # Tests utilitaires (18 tests)
 │   ├── test_models.py                 # Tests dataclasses (8 tests)
 │   ├── test_repository.py             # Tests repository (10 tests)
+│   ├── test_repository_cached.py      # Tests cache TTL (20 tests)
 │   ├── test_client.py                 # Tests HTTP client (10 tests)
 │   ├── test_cleaner.py                # Tests cleaner (11 tests)
 │   ├── test_catalog.py                # Tests catalogue (7 tests)
@@ -325,14 +333,19 @@ self._buckets: list[LinkedList[HashEntry[K, V]]] = [
 
 ### 1. Repository Pattern ✅
 
-**Fichier:** `meteo_toulouse/repository.py`
+**Fichiers:**
 
-**Description:** Encapsule la logique de stockage des stations et observations.
+- `meteo_toulouse/repository.py` — `WeatherRepositoryMemory`
+- `meteo_toulouse/repository_cached.py` — `CachedWeatherRepository`
+
+**Description:** Encapsule la logique de stockage des stations et observations avec support de cache TTL.
 
 **Avantages:**
 
 - Abstraction de la persistance (peut être remplacé par une DB sans changer le code métier)
 - Centralisation des requêtes de données
+- **Cache TTL (5 min)** : évite les requêtes API répétées pour la même station
+- **Héritage** : `CachedWeatherRepository` étend `WeatherRepositoryMemory`
 
 ---
 
@@ -489,7 +502,7 @@ Le `BasicCleaner` gère les variations de nommage :
 
 ### Tests Unitaires
 
-Le projet inclut **187 tests unitaires** répartis en **16 fichiers** (1 par module).
+Le projet inclut **200+ tests unitaires** répartis en **17 fichiers** (1 par module).
 
 ```bash
 # Installation
@@ -550,7 +563,7 @@ pytest tests/ --cov=meteo_toulouse --cov-report=term-missing
 
 **Tests:**
 
-- ✅ 187 tests unitaires (16 fichiers, 1 par module)
+- ✅ 200+ tests unitaires (17 fichiers, 1 par module)
 
 ---
 

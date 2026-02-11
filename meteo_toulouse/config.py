@@ -37,7 +37,7 @@ APP_CONFIG: dict[str, object] = {
         "max_stations": None,
     },
     "ui": {
-        "enable_carousel": True,
+        "enable_carousel": False,  # Desactive pour le chargement a la demande
         "carousel_delay_sec": 5,
     },
 }
