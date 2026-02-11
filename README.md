@@ -25,34 +25,34 @@ Application Python permettant de consulter les données météorologiques en tem
 
 ### ✅ Critères Respectés
 
-| Critère                          | Localisation dans le Code                                     | Statut |
-| -------------------------------- | ------------------------------------------------------------- | ------ |
-| **Exécution sans erreur**        | `python run.py` fonctionne                                    | ✅     |
-| **Principe SOLID**               | Modules séparés (Repository, Services, Client, UI)            | ✅     |
-| **Principe KISS**                | Code simple et lisible                                        | ✅     |
-| **Principe DRY**                 | Pas de duplication, méthodes réutilisables                    | ✅     |
-| **Principe YAGNI**               | Toutes classes/méthodes sont utilisées                        | ✅     |
-| **Documentation jeu de données** | Voir section "Datasets Utilisés" ci-dessous                   | ✅     |
-| **Documentation du code**        | Docstrings complètes + typage Python 3.12+                    | ✅     |
-| **Documentation utilisation**    | Ce README complet                                             | ✅     |
-| **Récupérer météo en ligne**     | `client.py` + `services/ingestion.py`                         | ✅     |
-| **Afficher la météo**            | `ui/renderer.py` + `ui/menu.py`                               | ✅     |
-| **Structuration projet**         | Architecture modulaire avec packages                          | ✅     |
-| **Liste chaînée**                | `data_structures/linked_list.py`                              | ✅     |
-| **File (Queue)**                 | `data_structures/queue.py`                                    | ✅     |
-| **Dictionnaire**                 | `data_structures/hash_map.py` (chaînage)                      | ✅     |
-| **Doc structures complexes**     | Docstrings "Structure de données: ..."                        | ✅     |
-| **Respect PEP8**                 | snake_case, CamelCase, conventions Python                     | ✅     |
-| **≥3 Design Patterns**           | 6 patterns (voir ci-dessous)                                  | ✅     |
-| **Tests unitaires**              | 187 tests dans `tests/` (1 fichier par module)                | ✅     |
+| Critère                          | Localisation dans le Code                          | Statut |
+| -------------------------------- | -------------------------------------------------- | ------ |
+| **Exécution sans erreur**        | `python run.py` fonctionne                         | ✅     |
+| **Principe SOLID**               | Modules séparés (Repository, Services, Client, UI) | ✅     |
+| **Principe KISS**                | Code simple et lisible                             | ✅     |
+| **Principe DRY**                 | Pas de duplication, méthodes réutilisables         | ✅     |
+| **Principe YAGNI**               | Toutes classes/méthodes sont utilisées             | ✅     |
+| **Documentation jeu de données** | Voir section "Datasets Utilisés" ci-dessous        | ✅     |
+| **Documentation du code**        | Docstrings complètes + typage Python 3.12+         | ✅     |
+| **Documentation utilisation**    | Ce README complet                                  | ✅     |
+| **Récupérer météo en ligne**     | `client.py` + `services/ingestion.py`              | ✅     |
+| **Afficher la météo**            | `ui/renderer.py` + `ui/menu.py`                    | ✅     |
+| **Structuration projet**         | Architecture modulaire avec packages               | ✅     |
+| **Liste chaînée**                | `data_structures/linked_list.py`                   | ✅     |
+| **File (Queue)**                 | `data_structures/queue.py`                         | ✅     |
+| **Dictionnaire**                 | `data_structures/hash_map.py` (chaînage)           | ✅     |
+| **Doc structures complexes**     | Docstrings "Structure de données: ..."             | ✅     |
+| **Respect PEP8**                 | snake_case, CamelCase, conventions Python          | ✅     |
+| **≥3 Design Patterns**           | 6 patterns (voir ci-dessous)                       | ✅     |
+| **Tests unitaires**              | 187 tests dans `tests/` (1 fichier par module)     | ✅     |
 
 ### 📊 Tests & Qualité
 
-| Critère                | Statut                          |
-| ---------------------- | ------------------------------- |
-| Tests unitaires        | ✅ 187 tests (16 fichiers)      |
-| Couverture             | `pytest --cov=meteo_toulouse`   |
-| Facilité d'utilisation | Menu interactif complet         |
+| Critère                | Statut                        |
+| ---------------------- | ----------------------------- |
+| Tests unitaires        | ✅ 187 tests (16 fichiers)    |
+| Couverture             | `pytest --cov=meteo_toulouse` |
+| Facilité d'utilisation | Menu interactif complet       |
 
 ---
 
@@ -102,10 +102,10 @@ ODS_DATASET_ID="37-station-meteo-toulouse-universite-paul-sabatier" python run.p
 
 ```bash
 # Tous les tests
-pytest tests/ -v
+python -m pytest tests/ -v
 
 # Avec couverture de code
-pytest tests/ --cov=meteo_toulouse --cov-report=term-missing
+python -m pytest tests/ --cov=meteo_toulouse --cov-report=term-missing
 ```
 
 ---
