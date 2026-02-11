@@ -70,6 +70,9 @@ pip install -r requirements.txt
 
 # Dépendances de développement (tests)
 pip install -r requirements-dev.txt
+
+# Dépendances PyLint
+pip install pylint
 ```
 
 ### Lancer l'Application
