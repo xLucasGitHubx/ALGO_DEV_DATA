@@ -106,6 +106,9 @@ python -m pytest tests/ -v
 
 # Avec couverture de code
 python -m pytest tests/ --cov=meteo_toulouse --cov-report=term-missing
+
+# Passage du code sous PyLint
+python -m pylint meteo_toulouse --output-format=text --reports=y
 ```
 
 ---
